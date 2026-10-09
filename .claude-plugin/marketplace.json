@@ -1,0 +1,19 @@
+{
+  "name": "defakof-skills",
+  "description": "Agent skills by defakof",
+  "owner": {
+    "name": "defakof"
+  },
+  "plugins": [
+    {
+      "name": "bethesda-esp",
+      "description": "Read, edit and patch Skyrim SE plugin files (.esp/.esm/.esl): inspect records, edit fields, build compatibility patches, merge leveled lists, clean ITMs, ESL-flag, delocalize.",
+      "source": "./",
+      "strict": false,
+      "version": "1.0.0",
+      "category": "gaming",
+      "keywords": ["skyrim", "bethesda", "esp", "esm", "esl", "modding", "xedit"],
+      "skills": ["./skills/bethesda-esp"]
+    }
+  ]
+}

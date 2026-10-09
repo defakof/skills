@@ -1,0 +1,8 @@
+# plugin, archive and strings files are binary
+*.esp binary
+*.esm binary
+*.esl binary
+*.bsa binary
+*.STRINGS binary
+*.DLSTRINGS binary
+*.ILSTRINGS binary
