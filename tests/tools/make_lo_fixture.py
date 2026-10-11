@@ -19,8 +19,7 @@ from esplib import Plugin, LoadOrder, ops                           # noqa: E402
 from esplib.core import Record, Subrecord, FLAG_DELETED, FLAG_ESM   # noqa: E402
 from esplib.fields import encode_items                              # noqa: E402
 
-OUT = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, '..', 'fixtures', 'lo'))
-DATA = os.path.join(OUT, 'Data')
+OUT = DATA = None
 
 
 def new_plugin(lo, name, masters, esm=False, esl=False, version=1.7):
@@ -53,7 +52,11 @@ def add_navmesh(p, cell, payload=b'\x01\x02\x03\x04', deleted=False, formid=None
     return nv
 
 
-def main():
+def build(out):
+    """Write the scenario to out/ (Data/, plugins.txt, Skyrim.ccc)."""
+    global OUT, DATA
+    OUT = os.path.abspath(out)
+    DATA = os.path.join(OUT, 'Data')
     if os.path.isdir(OUT):
         shutil.rmtree(OUT)
     os.makedirs(DATA)
@@ -69,6 +72,7 @@ def main():
     steel = rec(lo, sky, 'WEAP', 'SteelSword', [('FULL', 'Steel Sword'), ('KSIZ', 1), ('KWDA', [kw_steel.formid]),
                                                 ('DATA', {'value': 45, 'weight': 10.0, 'damage': 8})])
     rec(lo, sky, 'MISC', 'Gold001', [('FULL', 'Gold'), ('DATA', {'value': 1, 'weight': 0.0})])
+    rec(lo, sky, 'MISC', 'FoodApple', [('FULL', 'Apple'), ('DATA', {'value': 3, 'weight': 0.1})])
     lvli = rec(lo, sky, 'LVLI', 'LItemWeaponSwords', [('LVLD', 0), ('LVLF', {'flags': ['CalcFromAllLevels']}),
                                                       ('LVLO', {'level': 1, 'reference': iron.formid, 'count': 1}),
                                                       ('LVLO', {'level': 5, 'reference': steel.formid, 'count': 1})])
@@ -94,6 +98,8 @@ def main():
     upd = new_plugin(lo, 'Update.esm', ['Skyrim.esm'], esm=True)
     u_iron = copy(lo, sky, 'IronSword', upd)
     edit(lo, upd, u_iron, ('DATA.weight', '=', '8.5'))
+    u_apple = copy(lo, sky, 'FoodApple', upd)
+    edit(lo, upd, u_apple, ('DATA.value', '=', '4'))
     upd.save(backup=False)
 
     # ---- USSEP (ESM-flagged .esp) ------------------------------------------------
@@ -239,6 +245,26 @@ def main():
     rec(lo, cc, 'MISC', 'ccExampleItem', [('FULL', 'CC Item')])
     cc.save(backup=False)
 
+    # ---- master-flagged plugin that needs a regular plugin (the game hoists it) --------------
+    hd = new_plugin(lo, 'HoistDep.esp', ['Skyrim.esm'])
+    rec(lo, hd, 'KYWD', 'HoistDepKeyword')
+    hd.save(backup=False)
+    mn = new_plugin(lo, 'MasterNeedsEsp.esm', ['Skyrim.esm', 'HoistDep.esp'], esm=True)
+    rec(lo, mn, 'KYWD', 'MasterNeedsEspKeyword')
+    mn.save(backup=False)
+
+    # ---- a patch that is itself overridden by a later plugin -------------------------------
+    lp = new_plugin(lo, 'LateOverride.esp', ['Skyrim.esm'])
+    lp_lvl = copy(lo, sky, 'LItemWeaponSwords', lp)
+    edit(lo, lp, lp_lvl, ('LVLO', '+=', '{"level": 9, "reference": "SteelSword", "count": 3}'))
+    lp.save(backup=False)
+
+    # ---- a mod that wins a record Update.esm fixed, without Update.esm as a master -------------
+    rv = new_plugin(lo, 'Reverter.esp', ['Skyrim.esm'])
+    rv_apple = copy(lo, sky, 'FoodApple', rv)
+    edit(lo, rv, rv_apple, ('DATA.weight', '=', '0.2'))
+    rv.save(backup=False)
+
     with open(os.path.join(OUT, 'Skyrim.ccc'), 'w') as f:
         f.write('ccTestSSE001-Example.esl\nccNotInstalled.esm\n')
     order = [
@@ -249,13 +275,14 @@ def main():
         ('NeedsCompact - Addon.esp', True), ('OldLE.esp', True), ('MissingMaster.esp', True),
         ('NeedsInactive.esp', True), ('Dirty.esp', True), ('EdidDupe.esp', True), ('Injector1.esp', True),
         ('Injector2.esp', True), ('LateMaster.esm', True), ('Removed.esp', True),
+        ('MasterNeedsEsp.esm', True), ('HoistDep.esp', True), ('LateOverride.esp', True), ('Reverter.esp', True),
     ]
     with open(os.path.join(OUT, 'plugins.txt'), 'w') as f:
         f.write('# This file is used by Skyrim to keep track of your downloaded content.\n')
         for n, act in order:
             f.write(('*' if act else '') + n + '\n')
-    print('wrote', OUT)
+    return OUT
 
 
 if __name__ == '__main__':
-    main()
+    print('wrote', build(sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, '..', 'fixtures', 'lo')))

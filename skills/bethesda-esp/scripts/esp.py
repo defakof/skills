@@ -24,6 +24,7 @@ from esplib.fields import (decode_record, record_to_json, json_items, encode_ite
 from esplib.loadorder import LoadOrder, lookup_record, read_plugins_txt            # noqa: E402
 from esplib import schema_sse as schema                                            # noqa: E402
 from esplib import lorder, conflicts as conflicts_mod, eslify as eslify_mod, advice   # noqa: E402
+from esplib import masterlist as masterlist_mod                                    # noqa: E402
 
 OUT = sys.stdout
 
@@ -719,6 +720,12 @@ def cmd_itm(args):
 def cmd_esl(args):
     lo = make_lo(args)
     p = load(lo, args.plugin)
+    if args.header_171:
+        p.set_hedr(version=1.71)
+        say('header version set to 1.71 (light range 001-FFF; needs Skyrim SE 1.6.1130+ or BEES)')
+        if not args.flag and not args.unflag:
+            save(p, args)
+            return
     rep = ops.esl_report(p)
     if args.flag:
         if not rep['eligible_as_is']:
@@ -985,10 +992,12 @@ def cmd_bsa(args):
 # ---------------------------------------------------------------------------
 
 def load_model(args):
+    ml = getattr(args, 'masterlist', None)
     return lorder.LoadOrderModel.from_sources(
         plugins=args.plugins or None, data=args.data, plugins_txt=args.plugins_txt,
         loadorder_txt=args.loadorder_txt, mo2_profile=args.mo2, mods_dir=args.mods, ccc=args.ccc,
-        use_cache=not args.no_cache)
+        use_cache=not args.no_cache, masterlist=ml, userlist=getattr(args, 'userlist', None),
+        use_metadata=not getattr(args, 'no_loot', False) and ml != 'none')
 
 
 def _flags_str(e):
@@ -1005,15 +1014,21 @@ def _flags_str(e):
     return ','.join(bits) or 'ESP'
 
 
-def _print_issues(issues, limit=200):
+def _print_issues(issues, limit=200, include_info=True):
     order = {'error': 0, 'warning': 1, 'info': 2}
     issues = sorted(issues, key=lambda i: (order[i.level], i.code, i.plugin or ''))
+    hidden = 0
+    if not include_info:
+        hidden = sum(1 for i in issues if i.level == 'info')
+        issues = [i for i in issues if i.level != 'info']
     for i in issues[:limit]:
         say(f'  {i.level.upper():7} [{i.code}] {i.message}')
         if i.fix:
             say(f'          fix: {i.fix}')
     if len(issues) > limit:
         say(f'  ... {len(issues) - limit} more (use --json)')
+    if hidden:
+        say(f'  ({hidden} note(s) hidden; --all shows them)')
 
 
 def _load_rules(path):
@@ -1024,20 +1039,43 @@ def _load_rules(path):
 
 
 def write_plugins_txt(path, model, order):
-    """Write a plugins.txt (SE format, '*' = active) for the given order; inactive
-    entries keep their relative position at the end."""
-    lines = ['# Written by esp.py loadorder --write']
-    seen = set()
-    for e in order:
-        if e.implicit:
-            continue
-        lines.append('*' + e.name)
-        seen.add(e.low)
-    for e in sorted((x for x in model.entries if x.low not in seen and not x.implicit),
-                    key=lambda x: x.listed if x.listed is not None else 10 ** 6):
+    """Write a Skyrim SE plugins.txt ('*' = active, Windows-1252, CRLF) for the
+    given order. Base-game and Creation Club plugins are left out (the game
+    adds them itself); inactive or missing entries stay next to the plugin
+    they followed before. Returns names that could not be encoded."""
+    placed = [e for e in order if not e.implicit]
+    placed_low = {e.low for e in placed}
+    anchored = {}                 # lower name of preceding placed plugin (or None) -> [entries]
+    anchor = None
+    for e in sorted((x for x in model.entries if not x.implicit and x.listed is not None),
+                    key=lambda x: x.listed):
+        if e.low in placed_low:
+            anchor = e.low
+        else:
+            anchored.setdefault(anchor, []).append(e)
+    lines = ['# This file is used by Skyrim to keep track of your downloaded content.',
+             '# Written by esp.py loadorder --write']
+    for e in anchored.get(None, []):
         lines.append(('*' if e.active else '') + e.name)
-    with open(path, 'w', encoding='utf-8', newline='\r\n') as f:
+    for e in placed:
+        lines.append('*' + e.name)
+        for x in anchored.get(e.low, []):
+            lines.append(('*' if x.active else '') + x.name)
+    bad = []
+    for n in lines:
+        try:
+            n.encode('cp1252')
+        except UnicodeEncodeError:
+            bad.append(n.lstrip('*'))
+    with open(path, 'w', encoding='cp1252', errors='replace', newline='\r\n') as f:
         f.write('\n'.join(lines) + '\n')
+    return bad
+
+
+def _meta_desc(model):
+    if model.meta is None:
+        return model.meta_error or 'LOOT metadata off'
+    return '; '.join(model.meta.sources)
 
 
 def cmd_loadorder(args):
@@ -1047,20 +1085,29 @@ def cmd_loadorder(args):
     idx = model.load_indices(order)
     n_light = sum(1 for e in order if model.is_light(e))
     n_full = len(order) - n_light
+    max_full = model.max_full(order)
     inactive = [e for e in model.entries if not e.active and not e.implicit]
     rules = _load_rules(args.rules)
-    sorted_order, moves, notes = model.sort(rules=rules, use_overlap=not args.no_overlap)
-    if args.write:
-        write_plugins_txt(args.write, model, sorted_order)
+    sorted_order, moves, notes = model.sort(rules=rules, use_overlap=not args.no_overlap,
+                                            use_groups=not args.no_groups)
+    bad_names = write_plugins_txt(args.write, model, sorted_order) if args.write else []
+    groups = {e.low: model.group_of(e) for e in order} if model.meta else {}
     if args.json:
         say(dumps({
             'source': model.source_desc,
-            'counts': {'active': len(order), 'full': n_full, 'light': n_light, 'inactive': len(inactive)},
+            'manager': model.manager,
+            'game_version': '.'.join(map(str, model.game_version)) if model.game_version else None,
+            'metadata': _meta_desc(model),
+            'counts': {'active': len(order), 'full': n_full, 'full_limit': max_full, 'light': n_light,
+                       'inactive': len(inactive), 'unlisted': len(model.unlisted)},
             'effective_order': [{'index': idx[e.low], 'name': e.name, 'flags': _flags_str(e),
                                  'implicit': e.implicit, 'listed': e.listed, 'source': e.source,
+                                 'group': groups.get(e.low),
                                  'masters': e.scan.masters if e.scan else [],
                                  'new_records': e.scan.n_new() if e.scan else None,
-                                 'overrides': e.scan.n_override() if e.scan else None} for e in order],
+                                 'overrides': e.scan.n_override() if e.scan else None,
+                                 'header_version': round(e.scan.hedr_version, 2) if e.scan else None}
+                                for e in order],
             'issues': [i.as_dict() for i in issues],
             'suggested_order': [e.name for e in sorted_order],
             'moves': [{'plugin': e.name, 'reasons': list(dict.fromkeys(r))} for e, r in moves],
@@ -1068,8 +1115,11 @@ def cmd_loadorder(args):
             'written': args.write,
         }))
         return
-    say(f'Load order from {model.source_desc}')
-    say(f'  {len(order)} active plugins: {n_full} full (of 254 slots), {n_light} light (FE), '
+    say(f'Load order from {model.source_desc}' + (f' ({model.manager})' if model.manager else ''))
+    if model.game_version:
+        say(f'  game: SkyrimSE.exe {".".join(map(str, model.game_version))}')
+    say(f'  LOOT metadata: {_meta_desc(model)}')
+    say(f'  {len(order)} active plugins: {n_full} full (of {max_full} slots), {n_light} light (FE), '
         f'{len(inactive)} inactive')
     if not args.brief:
         say('')
@@ -1077,14 +1127,15 @@ def cmd_loadorder(args):
         for e in order:
             s = e.scan
             tag = f'  [{e.implicit}]' if e.implicit else ''
+            grp = f'  {{{groups[e.low]}}}' if args.groups and groups.get(e.low) not in (None, 'default') else ''
             src = f'  <{e.source}>' if args.sources and e.source else ''
             say(f'  {idx[e.low]:<6} {_flags_str(e):<8} {s.n_new() if s else "-":>5} {s.n_override() if s else "-":>5}  '
-                f'{e.name}{tag}{src}')
+                f'{e.name}{tag}{grp}{src}')
     say('')
     errs = [i for i in issues if i.level == 'error']
     say(f'Problems: {len(errs)} error(s), {sum(1 for i in issues if i.level == "warning")} warning(s), '
         f'{sum(1 for i in issues if i.level == "info")} note(s)')
-    _print_issues(issues)
+    _print_issues(issues, include_info=args.all)
     say('')
     if moves:
         say(f'Suggested changes ({len(moves)} plugin(s) move):')
@@ -1102,8 +1153,23 @@ def cmd_loadorder(args):
     for n in notes:
         say(f'  note: {n}')
     if args.write:
-        say(f'wrote {args.write} (review it, then copy over the real plugins.txt with the mod manager closed)')
-    say('Tip: LOOT knows thousands of mod-specific rules; use this check alongside it, not instead of it.')
+        say(f'wrote {args.write}: review it, then (with the game and mod manager closed) replace the plugins.txt '
+            'it came from' + (', or apply the order in MO2/Vortex' if model.manager else ''))
+        if bad_names:
+            say(f'  warning: {len(bad_names)} name(s) are not Windows-1252 and were written with "?": '
+                + ', '.join(bad_names[:5]))
+
+
+def cmd_loot_update(args):
+    try:
+        out, data = masterlist_mod.update_snapshot(args.source)
+    except RuntimeError as ex:
+        raise EspError(str(ex))
+    except OSError as ex:
+        raise EspError(f'could not get the masterlist: {ex} (download it in a browser from '
+                       f'{masterlist_mod.MASTERLIST_URL} and pass the file)')
+    say(f'LOOT masterlist: {len(data["plugins"])} plugin entries, {len(data["groups"])} groups from {data["source"]}')
+    say(f'saved to {out}; loadorder/scan use it from now on')
 
 
 def cmd_scan(args):
@@ -1131,14 +1197,28 @@ def cmd_scan(args):
     navcells = sc.navmesh_cells()
     edids = sc.edid_duplicates()
     _inj, collisions = sc.injected()
+    collided = {k for k, _n, _t in collisions}
+    confl_adv = [c for c in confl if c.formkey not in collided]
     reverts = sc.official_reverts()
+    if args.deep:
+        for plugin, d in reverts.items():
+            d['checked'] = True
+            for k in d['keys'][:args.max_deep]:
+                try:
+                    fl = dc.reverted_fields(k, d['fixers'])
+                except (EspError, OSError):
+                    fl = []
+                if fl:
+                    d['fields'][sc.formkey(k)] = fl
     _sorted, moves, _notes = model.sort()
     order = model.effective_order()
     n_full = sum(1 for e in order if not model.is_light(e))
     esl = eslify_mod.analyse(model)
-    adv = advice.from_validation(issues) + advice.from_sort(moves) + \
-        advice.from_conflicts(confl, deep=args.deep, scanner=sc) + \
-        advice.from_checks(dirty, navcells, edids, collisions, reverts, sc) + advice.from_eslify(esl, n_full)
+    over = sc.overridden_patches(confl)
+    adv = advice.from_validation(issues) + advice.from_sort(moves) + advice.from_overridden_patches(over) + \
+        advice.from_conflicts(confl_adv, deep=args.deep, scanner=sc) + \
+        advice.from_checks(dirty, navcells, edids, collisions, reverts, sc) + advice.from_eslify(
+            esl, n_full, model.max_full(order), eslify_mod.procedure(eslify_mod._game_supports_171(model)))
     adv = advice.sort_advice(adv)
     by_cat = {}
     for c in confl:
@@ -1160,7 +1240,10 @@ def cmd_scan(args):
             'navmesh_cells': [{'cell': k, 'plugins': [e.name for e in v]} for k, v in navcells],
             'editor_id_duplicates': [{'edid': k, 'where': v} for k, v in edids],
             'injected_collisions': [{'record': k, 'plugins': n, 'types': t} for k, n, t in collisions],
-            'reverted_fixes': [{'plugin': p, 'fixes_from': list(f), 'records': len(k)} for (p, f), k in reverts.items()],
+            'reverted_fixes': [{'plugin': p, 'fixes_from': d['fixers'], 'records': [sc.formkey(k) for k in d['keys']],
+                                'reverted_fields': d['fields'] if args.deep else None} for p, d in reverts.items()],
+            'overridden_patches': [{'patch': p, 'winner': w, 'records': [f'{c.sig} {c.formkey}' for c in cs]}
+                                   for (p, w), cs in over.items()],
             'recommendations': [a.as_dict() for a in adv],
         }))
         return
@@ -1213,29 +1296,36 @@ def cmd_eslify(args):
     model = load_model(args)
     cands = eslify_mod.analyse(model, configs=args.configs, deep_configs=args.deep_configs)
     order = model.effective_order()
-    n_full = sum(1 for e in order if not model.is_light(e))
+    n_light = sum(1 for e in order if model.is_light(e))
+    n_full = len(order) - n_light
+    max_full = model.max_full(order)
+    steps = eslify_mod.procedure(eslify_mod._game_supports_171(model))
     if args.json:
-        say(dumps({'full_plugins': n_full, 'candidates': [c.as_dict() for c in cands]}))
+        say(dumps({'full_plugins': n_full, 'full_limit': max_full, 'light_plugins': n_light,
+                   'candidates': [c.as_dict() for c in cands], 'procedure': steps}))
         return
     groups = {}
     for c in cands:
         groups.setdefault(c.verdict, []).append(c)
-    say(f'{n_full} of 254 full plugin slots used; {sum(1 for e in order if model.is_light(e))} light plugins')
+    say(f'{n_full} of {max_full} full plugin slots used; {n_light} light plugins')
     titles = {
-        'flag': 'Can be ESL-flagged as is (no FormID changes)',
-        'compact': 'Can become light after compacting FormIDs (nothing found that depends on them)',
-        'compact-care': 'Compacting would break files that use their FormIDs (use ESLifier or leave as is)',
+        'flag': 'Can be ESL-flagged as they are (no FormIDs change): esp esl <plugin> --flag',
+        'flag-171': 'Can be ESL-flagged after setting header 1.71 (no FormIDs change; game 1.6.1130+ or BEES): '
+                    'esp esl <plugin> --header-171 --flag',
+        'compact': 'Can become light after compacting FormIDs (nothing found that uses them; new game needed)',
+        'compact-care': 'Compacting would break files that use their FormIDs: only with ESLifier, or leave as is',
         'no': 'Should stay full plugins',
         'already': 'Already light',
     }
-    for v in ('flag', 'compact', 'compact-care', 'no', 'already'):
+    for v in ('flag', 'flag-171', 'compact', 'compact-care', 'no', 'already'):
         lst = groups.get(v, [])
         if not lst:
             continue
         say(f'\n{titles[v]}: {len(lst)}')
         for c in lst[:args.limit]:
             extra = f' ids {c.id_range}' if c.id_range else ' (only overrides)'
-            say(f'  {c.entry.name}: {c.n_new} new{extra}')
+            deps = f', master of {len(c.dependents)}' if c.dependents else ''
+            say(f'  {c.entry.name}: {c.n_new} new{extra}{deps}')
             for r in c.risks:
                 say(f'      risk: {r}')
             if v == 'no':
@@ -1245,7 +1335,9 @@ def cmd_eslify(args):
                 say(f'      file: {f}')
         if len(lst) > args.limit:
             say(f'  ... {len(lst) - args.limit} more')
-    say('\nFlag with: esp esl <plugin> --flag   (compact first with esp compact, or use ESLifier for the risky ones)')
+    say('\nHow to do it safely:')
+    for i, st in enumerate(steps, 1):
+        say(f'  {i}. {st}')
     if not args.configs:
         say('Add --configs to also search SKSE/INI/JSON configs that reference each plugin\'s FormIDs.')
 
@@ -1400,6 +1492,8 @@ def build_parser():
     sp.add_argument('plugin')
     sp.add_argument('--flag', action='store_true')
     sp.add_argument('--unflag', action='store_true')
+    sp.add_argument('--header-171', action='store_true',
+                    help='set header version 1.71 first (allows object IDs 001-7FF; game 1.6.1130+ or BEES)')
     sp.add_argument('--json', action='store_true')
 
     sp = add('compact', cmd_compact, 'renumber new records into the ESL range (0x800-0xFFF)', parents=[write])
@@ -1450,6 +1544,10 @@ def build_parser():
     lo_src.add_argument('--mods', help='MO2 mods folder (default: from ModOrganizer.ini)')
     lo_src.add_argument('--ccc', help='Skyrim.ccc (default: next to the Data folder)')
     lo_src.add_argument('--no-cache', action='store_true', help='rescan every plugin (ignore the scan cache)')
+    lo_src.add_argument('--masterlist', help='LOOT masterlist (.yaml needs PyYAML, or a json(.gz) snapshot); '
+                        '"none" to skip LOOT data. Default: bundled snapshot or the one from esp loot-update')
+    lo_src.add_argument('--userlist', help='LOOT/Vortex userlist.yaml (default: found automatically)')
+    lo_src.add_argument('--no-loot', action='store_true', help='ignore LOOT masterlist/userlist metadata')
 
     sp = add('loadorder', cmd_loadorder, 'check a load order (masters, flags, limits) and suggest a fixed order',
              parents=[lo_src],
@@ -1461,6 +1559,9 @@ def build_parser():
     sp.add_argument('--rules', help='JSON file with extra "load after/before" rules')
     sp.add_argument('--write', help='write the suggested order as a plugins.txt to this path')
     sp.add_argument('--no-overlap', action='store_true', help='do not use LOOT\'s record-overlap rule when sorting')
+    sp.add_argument('--no-groups', action='store_true', help='do not use LOOT groups when sorting')
+    sp.add_argument('--groups', action='store_true', help='show each plugin\'s LOOT group')
+    sp.add_argument('--all', action='store_true', help='also print notes (info-level findings)')
     sp.add_argument('--brief', action='store_true', help='do not print the whole order')
     sp.add_argument('--full-order', action='store_true', help='print the whole suggested order')
     sp.add_argument('--sources', action='store_true', help='show which MO2 mod / folder each plugin comes from')
@@ -1484,6 +1585,10 @@ def build_parser():
     sp.add_argument('--deep-configs', action='store_true', help='with --configs: search whole mod folders, not just SKSE/')
     sp.add_argument('--limit', type=int, default=60)
     sp.add_argument('--json', action='store_true')
+
+    sp = add('loot-update', cmd_loot_update, 'refresh the LOOT masterlist used by loadorder/scan (needs PyYAML)')
+    sp.add_argument('source', nargs='?', help='masterlist.yaml file or URL (default: LOOT\'s Skyrim SE masterlist '
+                    'on GitHub, branch v0.29)')
 
     sp = add('bsa', cmd_bsa, 'list or extract files from a BSA archive')
     sp.add_argument('archive')

@@ -1,7 +1,9 @@
 """Turn load-order validation, conflict scan and ESLify results into
 prioritised, concrete recommendations (which tool or command to use)."""
 
-from .conflicts import CATEGORY_INFO, SEVERITY_RANK, UNOFFICIAL_PATCHES
+import re
+
+from .conflicts import CATEGORY_INFO, SEVERITY_RANK, UNOFFICIAL_PATCHES, relevant_tags
 
 # Tools we may recommend. Keep descriptions factual; see references/loadorder.md.
 TOOLS = {
@@ -12,8 +14,11 @@ TOOLS = {
     'easynpc': 'EasyNPC (choose the appearance mod per NPC, keeps other mods\' NPC changes)',
     'xedit': 'SSEEdit (xEdit) conflict view / manual patch',
     'qac': 'SSEEdit Quick Auto Clean (removes ITMs, undeletes and disables deleted references)',
-    'ck': 'Creation Kit (navmesh edits must be made and finalized there)',
-    'eslifier': 'ESLifier (compacts FormIDs and also fixes FaceGen, voice files, SKSE configs and dependent plugins)',
+    'ck': 'Creation Kit (Bethesda\'s editor: resave LE plugins; navmesh edits are made and finalized there)',
+    'eslifier': 'ESLifier (flags or compacts plugins and patches FaceGen, voice, scripts, SEQ, SKSE configs and '
+                'dependent plugins to match)',
+    'esp-eslify': 'esp eslify (this skill: lists ESL candidates and blockers) and esp esl <plugin> --flag',
+    'bees': 'Backported Extended ESL Support (BEES, SKSE plugin for game 1.5.97-1.6.659)',
     'esp-merge': 'esp merge A.esp B.esp --into Patch.esp (this skill: 3-way merge of lists and changed fields)',
     'esp-copy': 'esp copy + esp set (this skill: hand-made override in a patch plugin)',
 }
@@ -42,35 +47,106 @@ def _q(name):
     return f'"{name}"' if ' ' in name else name
 
 
+# code -> (priority, why, tools); priority None = use the issue level
+VALIDATION_ADVICE = {
+    'missing-master': (1, 'The game crashes on start when a master is missing or inactive.', []),
+    'inactive-master': (1, 'The game crashes on start when a master is missing or inactive.', []),
+    'missing-base-master': (1, 'Without the base game masters nothing can load.', []),
+    'unreadable': (1, 'A damaged plugin crashes the game or the tools that read it.', []),
+    'self-master': (1, 'A plugin that lists itself as a master is broken.', []),
+    'master-order': (1, 'A plugin that loads before its master can lose its changes or crash the game.', ['loot']),
+    'master-needs-nonmaster': (1, 'The game moves the regular plugin into the master block, which changes which '
+                                  'records win; LOOT refuses to sort such a load order.', ['xedit']),
+    'esl-range': (1, 'A light plugin with FormIDs outside the light range breaks saves permanently.',
+                  ['eslifier', 'xedit']),
+    'too-many-plugins': (1, 'The game cannot load more full plugins; the extra ones are dropped or it crashes.',
+                         ['eslifier', 'esp-eslify']),
+    'too-many-light': (1, 'The game cannot load more than 4096 light plugins.', []),
+    'needs-bees': (1, 'Header 1.71 plugins crash games older than 1.6.1130.', ['bees']),
+    'loot-requires': (1, 'LOOT\'s masterlist says this plugin does not work without it.', []),
+    'loot-incompatible': (1, 'LOOT\'s masterlist says these two do not work together.', []),
+    'undefined-group': (2, 'LOOT cannot sort while a plugin uses an undefined group.', ['loot']),
+    'after-generated': (2, 'Generated patches only contain what loaded before them when they were built.',
+                        ['bashed', 'smash', 'synthesis', 'loot']),
+    'stale-patch': (2, 'Generated patches must be rebuilt after the mod list or order changes.',
+                    ['bashed', 'smash', 'synthesis']),
+    'dirty': (3, 'Deleted references and navmeshes can crash the game; ITMs revert other mods\' changes.', ['qac']),
+    'bad-filename': (2, 'plugins.txt is Windows-1252; the game cannot activate names it cannot store.', []),
+    'lo-desync': (3, 'Mod managers can overwrite one file from the other.', []),
+    'le-header': (3, 'Unconverted Skyrim LE plugins can misbehave in SE.', ['ck']),
+    'le-records': (4, 'Form 43 records are mostly fine; weapon critical data is read wrongly.', ['ck']),
+    'esl-new-cell': (3, 'New cells in light plugins are known to lose changes.', []),
+    'near-plugin-limit': (3, 'Close to the full-plugin limit.', ['esp-eslify', 'eslifier']),
+    'not-found': (3, '', []),
+    'duplicate-entry': (3, '', []),
+    'no-plugins-txt': (3, 'Without plugins.txt the real order is unknown.', []),
+}
+LOOT_MSG_PRIORITY = {'error': 2, 'warning': 3}
+
+
 def from_validation(issues):
     out = []
     for i in issues:
-        if i.level == 'error':
-            out.append(Advice(1, 'load-order', i.message, 'The game crashes or misbehaves with this.',
-                              [i.fix] if i.fix else [], ['loot'], [i.plugin] if i.plugin else []))
-        elif i.code in ('le-header', 'le-records'):
-            out.append(Advice(3, 'convert', i.message, 'Unconverted Skyrim LE plugins can break sounds and other '
-                              'records in SE.', [i.fix], ['ck'], [i.plugin]))
-        elif i.code in ('esl-new-cell', 'near-plugin-limit', 'not-found', 'duplicate-entry', 'no-plugins-txt'):
-            out.append(Advice(3, 'load-order', i.message, '', [i.fix] if i.fix else [], [], [i.plugin] if i.plugin else []))
+        if i.code in ('loot-message', 'loot-global'):
+            prio = LOOT_MSG_PRIORITY.get(i.level)
+            if prio:
+                out.append(Advice(prio, 'loot', i.message, 'From the LOOT masterlist.', [], ['loot'],
+                                  [i.plugin] if i.plugin else []))
+            continue
+        spec = VALIDATION_ADVICE.get(i.code)
+        if spec is None:
+            if i.level != 'error':
+                continue
+            spec = (1, '', [])
+        prio, why, tools = spec
+        if i.code == 'dirty' and i.level == 'warning':
+            prio = 2
+        elif i.code == 'dirty':
+            prio = 4
+        out.append(Advice(prio, 'load-order' if i.level == 'error' else i.code, i.message, why,
+                          [i.fix] if i.fix else [], tools, [i.plugin] if i.plugin else []))
     return out
 
 
-def from_sort(moves):
+def _yaml_q(name):
+    return "'" + name.replace("'", "''") + "'"
+
+
+def from_sort(moves, write_hint='esp loadorder <same options> --write plugins_sorted.txt'):
     if not moves:
         return []
     lines = []
+    rules = []
     for e, reasons in moves[:25]:
-        uniq = []
-        for r in reasons:
-            if r not in uniq:
-                uniq.append(r)
+        uniq = list(dict.fromkeys(reasons))
         lines.append(f'move {e.name}: ' + '; '.join(uniq[:2]))
+        for r in uniq:
+            m = re.match(r'rule: (.+) loads after (.+)$', r)
+            if m:
+                rules.append((m.group(1), m.group(2)))
+    how = lines + [f'Write the fixed order with: {write_hint} (or sort with LOOT and compare).']
+    if rules:
+        snippet = 'plugins:\n' + ''.join(f'  - name: {_yaml_q(a)}\n    after: [ {_yaml_q(b)} ]\n' for a, b in rules)
+        how.append('Your own rules are not known to LOOT; add them to the LOOT (or Vortex) userlist.yaml so the '
+                   'next LOOT sort keeps them:\n' + snippet)
     return [Advice(2, 'sort', f'{len(moves)} plugin(s) are out of order',
-                   'Masters must load before the plugins that use them, generated patches load last, and when two '
-                   'plugins override the same records the more specific (smaller) one should usually win.',
-                   lines + ['Write the fixed order with: esp loadorder ... --sort --write plugins_sorted.txt '
-                            '(or let LOOT sort and compare).'], ['loot'], [e.name for e, _ in moves])]
+                   'Masters load before the plugins that use them; LOOT\'s rules and groups put known mods '
+                   '(and generated patches) in place; when two plugins override the same records, the one that '
+                   'overrides fewer (the more specific) should usually win.',
+                   how, ['loot'], [e.name for e, _ in moves])]
+
+
+def from_overridden_patches(over):
+    out = []
+    for (patch, winner), cs in sorted(over.items(), key=lambda kv: -len(kv[1])):
+        out.append(Advice(2, 'patch-overridden', f'{patch} loses {len(cs)} record(s) to {winner}',
+                          'A compatibility patch only works where its records win; here a later plugin that does '
+                          'not include the patch\'s changes overrides it.',
+                          [f'If {winner} does not need to win those records, load {patch} after it.',
+                           f'Otherwise make a small patch on top of both: esp merge {_q(patch)} {_q(winner)} --into '
+                           f'"Patch.esp" --records {" ".join(c.formkey for c in cs[:6])}'],
+                          ['esp-merge', 'xedit'], [patch, winner], [f'{c.sig} {c.formkey}' for c in cs]))
+    return out
 
 
 def group_conflicts(conflicts):
@@ -87,12 +163,20 @@ def from_conflicts(conflicts, deep=False, scanner=None):
     out = []
     groups = group_conflicts(conflicts)
     smash_candidates = []
+    model = getattr(scanner, 'model', None)
+    tag_cache = {}
+
+    def tags(name):
+        if name not in tag_cache:
+            e = scanner.by_low.get(name.lower()) if scanner is not None else None
+            tag_cache[name] = model.tags_of(e) if (model is not None and e is not None) else []
+        return tag_cache[name]
+
     for (cat, names), cs in sorted(groups.items(), key=lambda kv: (SEVERITY_RANK[CATEGORY_INFO.get(kv[0][0], ('', 'low'))[1]],
                                                                   -len(kv[1]))):
         label, sev = CATEGORY_INFO.get(cat, CATEGORY_INFO['other'])
         winner = cs[0].winner.entry.name
         patched = [c for c in cs if c.patched]
-        recs = [f'{c.sig} {c.formkey}' for c in cs]
         if deep:
             statuses = {}
             for c in cs:
@@ -118,6 +202,13 @@ def from_conflicts(conflicts, deep=False, scanner=None):
         if not deep:
             why_bits.append('only the winner\'s version is used; run "esp scan --deep" to see whose changes are lost')
         how, tools = _how(cat, todo, plugins, deep)
+        tagged = [(p, relevant_tags(cat, tags(p))) for p in plugins if p != winner]
+        tagged = [(p, t) for p, t in tagged if t]
+        if tagged:
+            how = how + ['Wrye Bash\'s Bashed Patch can carry these changes over automatically (Bash Tags from '
+                         'LOOT): ' + '; '.join(f'{p} [{", ".join(t)}]' for p, t in tagged)]
+            if 'bashed' not in tools:
+                tools = tools + ['bashed']
         if cat in ('items', 'magic', 'crafting', 'actors', 'npc', 'leveled', 'containers', 'cells') and len(plugins) >= 3:
             smash_candidates.append((cat, len(todo)))
         out.append(Advice(prio, f'conflict:{cat}', title, '; '.join(why_bits), how, tools, plugins,
@@ -234,47 +325,75 @@ def from_checks(dirty, navcells, edid_dups, collisions, reverts, scanner):
                           'each other, so they overwrite each other\'s new record.',
                           ['Only one can work: keep one mod or ask the authors; renumbering needs a new FormID in the '
                            'mod\'s own space (esp copy --as-new) and fixing every reference.'], ['xedit'], names))
-    for (plugin, fixers), keys in sorted(reverts.items(), key=lambda kv: -len(kv[1])):
-        fx = ', '.join(fixers)
+    for plugin, d in sorted(reverts.items(), key=lambda kv: -len(kv[1]['keys'])):
+        fixers = d['fixers']
+        keys = d['keys']
+        checked = d.get('checked')
+        if checked is not None and not d['fields']:
+            continue                    # deep check: nothing actually reverted
         unofficial = any(f.lower() in UNOFFICIAL_PATCHES for f in fixers)
-        out.append(Advice(3 if not unofficial else 2, 'reverts-fixes',
-                          f'{plugin} overrides {len(keys)} record(s) also fixed by {fx} without using it as a master',
-                          'Its versions are based on the original game data, so they can undo those bug fixes '
-                          '(run esp scan --deep to see which fields).',
-                          [f'Look for a "{fx.split(",")[0].replace(".esp", "").replace(".esm", "")} patch" for '
-                           f'{plugin} on the mod page; otherwise forward the fixes with esp merge into a patch.'],
-                          ['esp-merge', 'xedit'], [plugin]))
+        short = [UNOFFICIAL_PATCHES.get(f.lower(), f) for f in fixers]
+        n = len(d['fields']) if checked is not None else len(keys)
+        detail = ''
+        if d['fields']:
+            detail = ' Reverted: ' + '; '.join(f'{rk}: {", ".join(fl[:4])}' for rk, fl in list(d['fields'].items())[:5])
+        out.append(Advice(2 if unofficial else 3, 'reverts-fixes',
+                          f'{plugin} wins {n} record(s) that {", ".join(short)} fixed, without using '
+                          f'{"it" if len(short) == 1 else "them"} as a master',
+                          ('Its versions are based on the unfixed game data, so the bug fixes are undone.' +
+                           detail) if checked is not None else
+                          'Its versions are based on the unfixed game data, so they can undo those bug fixes '
+                          '(esp scan --deep shows which fields).',
+                          ([f'Look for a USSEP-compatible version or patch of {plugin} on its mod page.']
+                           if unofficial else []) +
+                          [f'Forward the fixes into a patch that loads after {plugin}: esp merge '
+                           f'{" ".join(_q(f) for f in fixers)} {_q(plugin)} --into "Patch.esp" --records ' +
+                           ' '.join(scanner.formkey(k) for k in keys[:6]) +
+                           (' ...' if len(keys) > 6 else '')],
+                          ['esp-merge', 'xedit'], [plugin] + list(fixers)))
     return out
 
 
-def from_eslify(cands, n_full):
+def from_eslify(cands, n_full, max_full=254, steps=None):
     out = []
-    flag = [c for c in cands if c.verdict == 'flag' and c.n_new > 0 or c.verdict == 'flag' and not c.n_new]
+    flag = [c for c in cands if c.verdict == 'flag']
+    flag171 = [c for c in cands if c.verdict == 'flag-171']
     compact = [c for c in cands if c.verdict == 'compact']
     care = [c for c in cands if c.verdict == 'compact-care']
-    pressure = n_full > 200
-    if flag:
-        out.append(Advice(3 if pressure else 4, 'eslify-flag',
-                          f'{len(flag)} plugin(s) can be ESL-flagged as they are',
-                          f'Light plugins do not use one of the 254 full slots ({n_full} used). No FormIDs change.',
-                          [f'esp esl {_q(c.entry.name)} --flag' for c in flag[:15]] +
-                          (['... (esp eslify --json for all)'] if len(flag) > 15 else []) +
-                          ['Back up first; ESL-flag mid-playthrough only if you accept some risk to existing saves.'],
-                          ['eslifier'], [c.entry.name for c in flag]))
-    if compact:
-        out.append(Advice(4, 'eslify-compact', f'{len(compact)} plugin(s) can become light after compacting FormIDs',
-                          'Nothing else in the load order depends on their FormIDs (no FaceGen, voice, scripts or '
-                          'configs found).',
-                          [f'esp compact {_q(c.entry.name)} && esp esl {_q(c.entry.name)} --flag' for c in compact[:10]] +
-                          ['Only for new games: existing saves keep the old FormIDs.'], ['eslifier'],
-                          [c.entry.name for c in compact]))
-    if care:
-        out.append(Advice(4, 'eslify-care', f'{len(care)} plugin(s) could become light but compacting would break '
-                          'files that refer to their FormIDs',
-                          '; '.join(f'{c.entry.name}: {"; ".join(c.risks)}' for c in care[:5]),
-                          ['Use ESLifier (it renames FaceGen/voice files, updates SKSE configs and dependent '
-                           'plugins), or leave them as full plugins.'], ['eslifier'],
-                          [c.entry.name for c in care]))
+    if n_full > max_full:
+        prio = 1
+    elif n_full > max_full - 14:
+        prio = 2
+    elif n_full > 200:
+        prio = 3
+    else:
+        prio = 4
+    need = max(0, n_full - max_full)
+    room = f'{n_full} of {max_full} full slots used' + (f'; at least {need} must go' if need else '')
+    steps = steps or []
+    if flag or flag171:
+        cmds = [f'esp esl {_q(c.entry.name)} --flag' for c in flag[:15]] + \
+               [f'esp esl {_q(c.entry.name)} --header-171 --flag' for c in flag171[:10]]
+        more = len(flag) + len(flag171) - len(cmds)
+        out.append(Advice(prio, 'eslify-flag',
+                          f'{len(flag) + len(flag171)} plugin(s) can be ESL-flagged without changing FormIDs',
+                          f'Light plugins do not take one of the {max_full} full slots ({room}).'
+                          + ('' if prio < 4 else ' Optional while you have free slots.'),
+                          cmds + ([f'... {more} more (esp eslify --json lists all)'] if more > 0 else []) + steps[:2],
+                          ['esp-eslify', 'eslifier'], [c.entry.name for c in flag + flag171]))
+    if compact or care:
+        out.append(Advice(min(prio + 1, 4), 'eslify-compact',
+                          f'{len(compact) + len(care)} more plugin(s) could become light only by compacting their '
+                          'FormIDs',
+                          'Compacting renumbers records: existing saves break, and FaceGen, voice files, scripts, '
+                          'SKSE configs and dependent plugins must be patched to match. '
+                          + '; '.join(f'{c.entry.name}: {"; ".join(c.risks)}' for c in care[:4]),
+                          ['Use ESLifier for these (it patches the dependent files); only on a new game.'] +
+                          [f'Nothing found that depends on their FormIDs: {", ".join(c.entry.name for c in compact[:8])}'
+                           f' (esp compact <plugin> then esp esl <plugin> --flag also works for these)'
+                           if compact else ''] + steps[2:],
+                          ['eslifier'], [c.entry.name for c in compact + care]))
+        out[-1].how = [h for h in out[-1].how if h]
     return out
 
 

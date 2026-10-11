@@ -17,7 +17,7 @@ from array import array
 from .core import EspError, parse_subrecords, _find_sub, FLAG_COMPRESSED, FLAG_DELETED
 from .loadorder import cache_dir
 
-SCAN_VERSION = 3
+SCAN_VERSION = 4
 
 _REC = struct.Struct('<4sIII')       # sig, size, flags, formid
 _GRP = struct.Struct('<4sI4si')      # 'GRUP', size, label, type
@@ -52,6 +52,7 @@ class PluginScan:
         self.navm_cells = {}            # NAVM FormID -> parent CELL FormID (file-local)
         self.new_edids = {}             # object id -> EditorID, for records this plugin defines
         self.has_scripts = 0            # records with a VMAD subrecord (sampled on new records)
+        self.crc = None                 # CRC-32 of the whole file (LOOT dirty/clean lookups)
         self.error = None
 
     # -- derived -----------------------------------------------------------
@@ -155,6 +156,7 @@ def scan_bytes(buf, name, path=''):
     s.name = name
     s.path = path
     s.size = len(buf)
+    s.crc = zlib.crc32(buf) & 0xFFFFFFFF
     if len(buf) < 24 or buf[:4] != b'TES4':
         raise EspError(f'{name}: not a TES4-format plugin')
     _, hsize, hflags, _ = _REC.unpack_from(buf, 0)

@@ -650,12 +650,14 @@ def esl_report(plugin):
     worlds = [r for r in new if r.sig == 'WRLD']
     warn = []
     if cells:
-        warn.append(f'{len(cells)} new CELL record(s): new cells in light plugins can lose their '
-                    f'changes on reload in older runtimes; prefer keeping them in a full plugin')
+        warn.append(f'{len(cells)} new CELL record(s): in a light plugin, new cells overridden by other plugins '
+                    'lose temporary references and interior cells reload wrongly unless SSE Engine Fixes 7.0.13+ '
+                    '(bESLCELLLoadBug) is installed')
     if worlds:
-        warn.append(f'{len(worlds)} new WRLD record(s)')
+        warn.append(f'{len(worlds)} new WRLD record(s): light plugins can lose the landscape of new worldspaces '
+                    '(no fix exists); keep it a full plugin')
     if v171:
-        warn.append('header version 1.71: object IDs below 0x800 need Skyrim SE 1.6.1130+ (or BEES)')
+        warn.append('header version 1.71: needs Skyrim SE 1.6.1130+ (or BEES on older games)')
     return {
         'new_records': len(new), 'min_id': ids[0] if ids else None, 'max_id': ids[-1] if ids else None,
         'eligible_as_is': not problems, 'problems': problems, 'warnings': warn,

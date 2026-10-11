@@ -10,7 +10,7 @@ lost (and whether they are list entries, single fields, or real clashes).
 
 import json
 
-from .core import Plugin, EspError, record_context
+from .core import Plugin, EspError
 from .fields import decode_record, to_jsonable
 from . import ops
 
@@ -58,6 +58,27 @@ CATEGORY_INFO = {
     'other': ('Other records', 'low'),
 }
 SEVERITY_RANK = {'high': 0, 'medium': 1, 'low': 2}
+
+# Wrye Bash tags that let the Bashed Patch forward a plugin's changes, per
+# category (exact names, or prefixes ending in '.').
+CATEGORY_BASH_TAGS = {
+    'leveled': {'Delev', 'Relev'},
+    'containers': {'Invent.Add', 'Invent.Change', 'Invent.Remove', 'Outfits.Add', 'Outfits.Remove', 'Names',
+                   'Keywords', 'Destructible', 'Sound'},
+    'npc': {'Actors.', 'NPC.', 'Invent.', 'Outfits.', 'Factions', 'Names', 'Keywords', 'NpcFacesForceFullImport'},
+    'items': {'Names', 'Stats', 'Keywords', 'Graphics', 'Sound', 'Text', 'Enchantments', 'ObjectBounds',
+              'Destructible', 'EnchantmentStats', 'Invent.'},
+    'magic': {'Names', 'Stats', 'Keywords', 'EffectStats', 'EnchantmentStats', 'Spells', 'Text', 'Sound',
+              'Graphics', 'SpellStats'},
+    'actors': {'R.', 'Body-', 'Voice-', 'Relations.', 'Factions'},
+    'cells': {'C.'},
+    'crafting': {'Names'},
+}
+
+
+def relevant_tags(category, tags):
+    want = CATEGORY_BASH_TAGS.get(category, ())
+    return sorted(t for t in tags if t in want or any(w.endswith(('.', '-')) and t.startswith(w) for w in want))
 
 # NPC subrecords that make up the face/appearance (must match FaceGen files)
 NPC_VISUAL = {'PNAM', 'HCLF', 'FTST', 'QNAM', 'NAM9', 'NAMA', 'TINI', 'TINC', 'TINV', 'TIAS', 'WNAM',
@@ -159,6 +180,10 @@ class Scanner:
     def key_owner(self, key):
         return self.owner_names[key >> 24], key & 0xFFFFFF
 
+    def formkey(self, key):
+        owner, obj = self.key_owner(key)
+        return f'{obj:06X}:{owner}'
+
     def masters_closure(self, e):
         """All (transitive) masters of an entry, lowercase."""
         c = self._masters_closure.get(e.low)
@@ -201,6 +226,31 @@ class Scanner:
             c.patched = all(v.entry is w or v.entry.low in mc for v in overriders)
             out.append(c)
         out.sort(key=lambda c: (SEVERITY_RANK[CATEGORY_INFO.get(c.category, ('', 'low'))[1]], c.sig, c.key))
+        return out
+
+    def is_patch(self, e):
+        """A compatibility patch: needs two or more non-official mods as masters
+        (or one, if it calls itself a patch)."""
+        s = e.scan
+        if s is None or e.implicit or self.model.is_generated(e):
+            return False
+        mods = [m for m in s.masters
+                if not (self.by_low.get(m.lower()) is not None and self.by_low[m.lower()].implicit)
+                and m.lower() not in UNOFFICIAL_PATCHES]
+        return len(mods) >= 2 or (len(mods) == 1 and 'patch' in e.low)
+
+    def overridden_patches(self, conflicts):
+        """{(patch name, winner name): [Conflict]} where a patch's version of a
+        record is beaten by a later plugin that does not build on the patch."""
+        out = {}
+        for c in conflicts:
+            w = c.winner.entry
+            mc = self.masters_closure(w)
+            for v in c.overriders:
+                e = v.entry
+                if e is w or e.low in mc or not self.is_patch(e):
+                    continue
+                out.setdefault((e.name, w.name), []).append(c)
         return out
 
     # -- other checks --------------------------------------------------------------
@@ -298,26 +348,29 @@ class Scanner:
                 break
         return injections, collisions
 
-    def official_reverts(self, conflicts_only=False):
-        """Overrides that probably undo fixes from Update.esm/DLC or the
-        Unofficial Patch: the mod overrides a record that such a plugin also
-        changed, loads after it, but doesn't have it as a master."""
+    def official_reverts(self):
+        """Winning overrides that probably undo fixes from Update.esm/DLC or the
+        Unofficial Patch: the winner overrides a record that such a plugin also
+        changed, loads after it, but does not have it as a master.
+        Returns {plugin name: {'fixers': [names], 'keys': [record keys]}}."""
         out = {}
         for key, vers in self.versions.items():
-            fixers = [v for v in vers if v.entry.implicit and v.entry.low != vers[0].entry.low] + \
+            fixers = [v for v in vers[1:] if v.entry.implicit] + \
                      [v for v in vers if v.entry.low in UNOFFICIAL_PATCHES]
             if not fixers:
                 continue
-            for v in vers:
-                e = v.entry
-                if e.implicit or e.low in UNOFFICIAL_PATCHES:
-                    continue
-                mc = self.masters_closure(e)
-                missed = [f.entry.name for f in fixers
-                          if f.entry.low not in mc and self.pos[f.entry.low] < self.pos[e.low]]
-                if missed:
-                    d = out.setdefault((e.name, tuple(missed)), [])
-                    d.append(key)
+            w = vers[-1]
+            e = w.entry
+            if e.implicit or e.low in UNOFFICIAL_PATCHES or self.model.is_generated(e):
+                continue
+            mc = self.masters_closure(e)
+            missed = [f for f in fixers if f.entry.low not in mc and self.pos[f.entry.low] < self.pos[e.low]]
+            if missed:
+                d = out.setdefault(e.name, {'fixers': [], 'keys': [], 'fields': {}})
+                for f in missed:
+                    if f.entry.name not in d['fixers']:
+                        d['fixers'].append(f.entry.name)
+                d['keys'].append(key)
         return out
 
 
@@ -374,6 +427,47 @@ class DeepComparer:
                 if x.entry.low == c.owner.lower():
                     base = x
         return base
+
+    def reverted_fields(self, key, fixer_names):
+        """Fields that a fixer (Update.esm, USSEP...) changed and the winning
+        version sets back to the value before the fix."""
+        vers = self.scanner.versions.get(key) or []
+        if len(vers) < 2:
+            return []
+        owner, obj = self.scanner.key_owner(key)
+        c = Conflict(key, owner, obj, vers[0].sig, vers)
+        win, _ = self.fields(c.winner)
+        if win is None:
+            return []
+        out = []
+        low = {n.lower() for n in fixer_names}
+        for v in vers:
+            if v.entry.low not in low:
+                continue
+            f, _ = self.fields(v)
+            bver = self.base_for(c, v)
+            base, _ = self.fields(bver) if bver is not None and bver is not v else ({}, 0)
+            if f is None or base is None:
+                continue
+            for sig in sorted(set(f) | set(base)):
+                if sig in COUNTER_SIGS or sig == 'EDID':
+                    continue
+                pv, bv, wv = f.get(sig, []), base.get(sig, []), win.get(sig, [])
+                if pv == bv or wv == pv:
+                    continue
+                structs = _single_dicts(pv, bv, wv)
+                if structs is not None:
+                    p, b, w = structs
+                    out += [f'{sig}.{k}' for k in p if not k.startswith('_') and p.get(k) != b.get(k)
+                            and w.get(k) == b.get(k)]
+                elif sig in ops.MERGE_RULES or sig in ops.MERGE_ARRAYS:
+                    pe, be, we = _entries(sig, pv), _entries(sig, bv), _entries(sig, wv)
+                    if [x for x in pe if x not in be and x not in we] or \
+                            [x for x in be if x not in pe and x in we]:
+                        out.append(sig)
+                elif wv == bv:
+                    out.append(sig)
+        return list(dict.fromkeys(out))
 
     def compare(self, c):
         win, wflags = self.fields(c.winner)
