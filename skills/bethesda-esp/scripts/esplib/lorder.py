@@ -715,7 +715,7 @@ class LoadOrderModel:
                     issues.append(Issue('error', 'esl-range', e.name,
                                         f'{e.name} is a light plugin but {len(bad)} new record(s) have object IDs '
                                         f'outside {lo_bound:03X}-FFF; using it damages saves irreversibly (LOOT)',
-                                        f'Remove the ESL flag, or compact its FormIDs first (xEdit "Compact FormIDs '
+                                        'Remove the ESL flag, or compact its FormIDs first (xEdit "Compact FormIDs '
                                         'for ESL", or ESLifier) - this breaks plugins/saves that use it.'))
                 new_cells = sum(1 for fid, sig, _ in s.records() if sig == 'CELL' and (fid >> 24) == s.self_index)
                 if new_cells:
@@ -867,7 +867,7 @@ class LoadOrderModel:
                 det = item.get('t', '') if isinstance(item, dict) else ''
                 out.append(Issue('error', 'loot-incompatible', e.name,
                                  f'{e.name} is incompatible with {disp}, but both are present ({src}). {det}'.strip(),
-                                 f'Disable one of them (or find a compatibility patch).', [name]))
+                                 'Disable one of them (or find a compatibility patch).', [name]))
         crc = e.scan.crc if e.scan else None
         if crc is not None:
             for d in pm.dirty:

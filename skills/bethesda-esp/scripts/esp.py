@@ -1267,7 +1267,7 @@ def cmd_scan(args):
             'lost; forwardable = fields silently reverted by the winner; clash = mods changed the same field '
             'differently')
     if dirty:
-        say(f'Dirty edits: ' + ', '.join(f'{k} ({v["udr"]} deleted refs, {v["deleted_navmesh"]} deleted navmeshes)'
+        say('Dirty edits: ' + ', '.join(f'{k} ({v["udr"]} deleted refs, {v["deleted_navmesh"]} deleted navmeshes)'
                                          for k, v in dirty.items()))
     if args.details:
         say('')

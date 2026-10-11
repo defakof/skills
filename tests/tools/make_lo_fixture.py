@@ -9,14 +9,13 @@ analysis treats them like the real thing.
 
 import os
 import shutil
-import struct
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', '..', 'skills', 'bethesda-esp', 'scripts'))
 
 from esplib import Plugin, LoadOrder, ops                           # noqa: E402
-from esplib.core import Record, Subrecord, FLAG_DELETED, FLAG_ESM   # noqa: E402
+from esplib.core import Record, Subrecord, FLAG_DELETED             # noqa: E402
 from esplib.fields import encode_items                              # noqa: E402
 
 OUT = DATA = None
@@ -73,12 +72,12 @@ def build(out):
                                                 ('DATA', {'value': 45, 'weight': 10.0, 'damage': 8})])
     rec(lo, sky, 'MISC', 'Gold001', [('FULL', 'Gold'), ('DATA', {'value': 1, 'weight': 0.0})])
     rec(lo, sky, 'MISC', 'FoodApple', [('FULL', 'Apple'), ('DATA', {'value': 3, 'weight': 0.1})])
-    lvli = rec(lo, sky, 'LVLI', 'LItemWeaponSwords', [('LVLD', 0), ('LVLF', {'flags': ['CalcFromAllLevels']}),
+    rec(lo, sky, 'LVLI', 'LItemWeaponSwords', [('LVLD', 0), ('LVLF', {'flags': ['CalcFromAllLevels']}),
                                                       ('LVLO', {'level': 1, 'reference': iron.formid, 'count': 1}),
                                                       ('LVLO', {'level': 5, 'reference': steel.formid, 'count': 1})])
     race = rec(lo, sky, 'RACE', 'NordRace', [('FULL', 'Nord')])
     hair = rec(lo, sky, 'HDPT', 'HairMaleNord01')
-    npc = rec(lo, sky, 'NPC_', 'Ulfric', [('FULL', 'Ulfric Stormcloak'), ('RNAM', race.formid),
+    rec(lo, sky, 'NPC_', 'Ulfric', [('FULL', 'Ulfric Stormcloak'), ('RNAM', race.formid),
                                          ('ACBS', {'flags': ['Essential', 'Unique'], 'level': 40}),
                                          ('PNAM', hair.formid), ('NAM6', 1.0), ('NAM7', 50.0)])
     rec(lo, sky, 'GMST', 'fJumpHeightMin', [('DATA', 76.0)])
@@ -91,7 +90,7 @@ def build(out):
     set_edid = ops.set_edid
     set_edid(ref, 'BannedMareBarrelRef', sky)
     navm = add_navmesh(sky, cell)
-    quest = rec(lo, sky, 'QUST', 'MQ101', [('FULL', 'Unbound')])
+    rec(lo, sky, 'QUST', 'MQ101', [('FULL', 'Unbound')])
     sky.save(backup=False)
 
     # ---- Update.esm: fixes IronSword ------------------------------------------
@@ -115,7 +114,7 @@ def build(out):
     a = new_plugin(lo, 'ModA.esp', ['Skyrim.esm'])
     a_iron = copy(lo, sky, 'IronSword', a)                         # no Update/USSEP master: reverts their fixes
     edit(lo, a, a_iron, ('DATA.damage', '=', '9'))
-    a_sword = rec(lo, a, 'WEAP', 'ModASword', [('FULL', 'ModA Sword'), ('DATA', {'value': 99, 'weight': 5.0, 'damage': 11})])
+    rec(lo, a, 'WEAP', 'ModASword', [('FULL', 'ModA Sword'), ('DATA', {'value': 99, 'weight': 5.0, 'damage': 11})])
     a_lvl = copy(lo, sky, 'LItemWeaponSwords', a)
     edit(lo, a, a_lvl, ('LVLO', '+=', '{"level": 3, "reference": "ModASword", "count": 1}'))
     a_npc = copy(lo, sky, 'Ulfric', a)
@@ -136,11 +135,11 @@ def build(out):
     b = new_plugin(lo, 'ModB.esp', ['Skyrim.esm', 'Update.esm', 'Unofficial Skyrim Special Edition Patch.esp'])
     b_iron = copy(lo, us, 'IronSword', b)
     edit(lo, b, b_iron, ('DATA.value', '=', '60'))
-    b_sword = rec(lo, b, 'WEAP', 'ModBSword', [('FULL', 'ModB Sword'), ('DATA', {'value': 77, 'weight': 6.0, 'damage': 12})])
+    rec(lo, b, 'WEAP', 'ModBSword', [('FULL', 'ModB Sword'), ('DATA', {'value': 77, 'weight': 6.0, 'damage': 12})])
     b_lvl = copy(lo, sky, 'LItemWeaponSwords', b)
     edit(lo, b, b_lvl, ('LVLO', '-=', 'SteelSword'), ('LVLO', '+=', '{"level": 4, "reference": "ModBSword", "count": 2}'))
     b_npc = copy(lo, us, 'Ulfric', b)
-    hair2 = rec(lo, b, 'HDPT', 'ModBHair')
+    rec(lo, b, 'HDPT', 'ModBHair')
     edit(lo, b, b_npc, ('PNAM', '=', 'ModBHair'), ('NAM6', '=', '1.05'))       # visual change only
     b_cell = copy(lo, sky, 'WhiterunBanneredMare', b)
     edit(lo, b, b_cell, ('FULL', '=', 'The Bannered Mare Inn'))
@@ -236,7 +235,7 @@ def build(out):
 
     # ---- generated patch listed too early; ESM-flagged mod listed after ESPs; CC plugin ------
     bp = new_plugin(lo, 'Bashed Patch, 0.esp', ['Skyrim.esm', 'ModA.esp', 'ModB.esp'])
-    bp_lvl = copy(lo, b, 'LItemWeaponSwords', bp)
+    copy(lo, b, 'LItemWeaponSwords', bp)
     bp.save(backup=False)
     lm = new_plugin(lo, 'LateMaster.esm', ['Skyrim.esm'], esm=True)
     rec(lo, lm, 'KYWD', 'LateMasterKeyword')
