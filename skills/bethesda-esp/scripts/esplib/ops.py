@@ -476,7 +476,9 @@ def new_record(plugin, sig, edid=None, fields=None, lo=None):
     for item in fields or []:
         items.append(item)
     parser = lo.parser_for(plugin) if lo else None
-    subs = encode_items(sig, items, plugin, formid_parser=parser)
+    ctx_rec = Record(sig, 0, 0, [Subrecord('EDID', edid.encode(plugin.encoding) + b'\0')] if edid else [], 44)
+    ctx_rec.plugin = plugin          # GMST values are typed by their EditorID
+    subs = encode_items(sig, items, plugin, record=ctx_rec, formid_parser=parser)
     rec = Record(sig, allocate_formid(plugin), 0, subs, 44)
     rec._raw = None
     place_record(plugin, rec, {})
