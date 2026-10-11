@@ -139,7 +139,9 @@ subrecords (effects, conditions) come from the winner.
   other records in the same plugin reference them unless `--force`.
 - `--mark`: keep the record, set the Deleted flag and strip its data (deletes a master record in game).
 - `--disable`: for REFR/ACHR/... from masters: undelete, set Initially Disabled, enable parent =
-  PlayerRef (opposite state), Z = -30000. This is the safe way to remove placed objects.
+  PlayerRef (opposite state), Z = -30000. This is the safe way to remove placed objects, and it also
+  fixes deleted references (UDRs): a stripped deleted override first gets its fields back from the
+  latest master version (as xEdit's undelete does).
 
 ### masters PLUGIN [--add NAME ...] [--clean] [--rename OLD=NEW]
 Shows masters. `--add` appends (the plugin's own FormIDs move to the new index, references follow).
@@ -151,10 +153,11 @@ Reports overrides identical to the master version they override (flags + decoded
 FormIDs as FormKeys). `--clean` removes them. CELL/WRLD/DIAL that carry child overrides are skipped
 unless `--include-parents`.
 
-### esl PLUGIN [--flag|--unflag] [--json]
+### esl PLUGIN [--flag|--unflag] [--header-171] [--json]
 Reports new-record count and object-ID range against the light-plugin limits
 (0x800-0xFFF; 0x001-0xFFF with header 1.71 on 1.6.1130+), warns about new CELL/WRLD records.
-`--flag` refuses if the plugin is not eligible.
+`--flag` refuses if the plugin is not eligible. `--header-171` sets header version 1.71 first
+(needed when new records use 001-7FF; game 1.6.1130+ or BEES). For a whole load order use `eslify`.
 
 ### compact PLUGIN [--start 0x800]
 Renumbers the plugin's own records into the ESL range and fixes every reference inside the plugin.
@@ -166,6 +169,73 @@ and clears the Localized flag.
 
 ### export PLUGIN [RECORD...] [-t TYPE] [-o FILE]
 JSON list of records (same format as `show --json`), to a file or stdout.
+
+---
+
+## Whole load order
+
+These commands share the load-order options:
+
+| option | meaning |
+|---|---|
+| `PLUGIN...` | plugin files or names in load order (instead of a plugins.txt; all treated as active) |
+| `--plugins-txt FILE` | the game's or a profile's plugins.txt (`*` = active) |
+| `--mo2 PROFILE_DIR` | MO2 profile folder: reads its plugins.txt/loadorder.txt/modlist.txt and ModOrganizer.ini (game path, mods folder); plugin files are found by mod priority |
+| `--data DIR` | game Data folder (also locates `Skyrim.ccc` and `SkyrimSE.exe` next to it) |
+| `--loadorder-txt FILE` | compared with plugins.txt (desync warning); used alone only if there is no plugins.txt |
+| `--mods DIR` / `--ccc FILE` | override the MO2 mods folder / Skyrim.ccc location |
+| `--masterlist FILE` / `--userlist FILE` / `--no-loot` | LOOT metadata: masterlist (`.yaml` needs PyYAML, or a `.json(.gz)` snapshot; default: the bundled or updated snapshot), userlist (default: LOOT's or Vortex's, found automatically), or none |
+| `--no-cache` | rescan every plugin (header scans are cached per file in `~/.cache/bethesda-esp/scan`) |
+
+Without `--plugins-txt`/`--mo2`, plugins.txt is looked for in `%LOCALAPPDATA%` (Steam/GOG/Epic/MS
+folder chosen from the game folder) and the Proton prefix.
+
+### loadorder [options] [--rules FILE] [--write FILE] [--groups] [--sources] [--all] [--brief] [--full-order] [--no-overlap] [--no-groups] [--json]
+Effective order with load indices (`00`, `FE:001`), flags, new/override counts, then problems and
+suggested moves with reasons. Codes (level):
+
+| code | level | meaning |
+|---|---|---|
+| `missing-master`, `inactive-master` | error | game crashes on start (skipped for Bash `Filter` patches) |
+| `master-order` | error | plugin loads before its master |
+| `master-needs-nonmaster` | error | master-flagged plugin depends on a regular plugin (game hoists it; LOOT cannot sort) |
+| `esl-range` | error | light plugin with new records outside its range (breaks saves) |
+| `too-many-plugins`, `too-many-light` | error | above 254 (255 without lights) full / 4096 light plugins |
+| `needs-bees` | error | header 1.71 plugins on a game older than 1.6.1130 without BEES |
+| `loot-requires`, `loot-incompatible`, `undefined-group` | error | LOOT masterlist/userlist rules |
+| `loot-message`, `loot-global` | per message | LOOT masterlist messages whose conditions hold |
+| `dirty` | warning | CRC matches a LOOT dirty entry (ITM/UDR/deleted navmesh counts) |
+| `after-generated`, `generated-order`, `synthesis-split`, `stale-patch` | warning | generated patch placement / out of date |
+| `le-header`, `le-records` | warning/info | Skyrim LE plugin not converted |
+| `esl-new-cell`, `near-plugin-limit`, `not-found`, `duplicate-entry`, `bad-filename`, `lo-desync` | warning | |
+| `master-partition`, `unlisted`, `hedr-171`, `no-ccc` | info (shown with `--all`) | |
+
+`--rules` JSON: `{"Plugin.esp": {"after": ["Other.esp"], "before": ["X.esp"]}}` (hard rules, like
+LOOT userlist `after`). `--write` writes the suggested order as a Windows-1252 plugins.txt
+(hardcoded/CC plugins left out, inactive and missing entries kept next to their neighbours).
+`--groups` shows LOOT groups, `--sources` the MO2 mod each plugin comes from.
+
+### scan [options] [--deep] [--max-deep N] [--only PLUGIN] [-t TYPE] [--details] [--limit N] [--limit-records N] [--json]
+Conflict scan of the whole load order plus all `loadorder` checks, ending in a prioritized list
+of recommendations (critical/high/medium/low) with concrete commands and tools. Quick mode reads
+record headers only (seconds, cached); `--deep` compares conflicting records field by field
+(statuses identical/resolved/lists/forwardable/clash; reverted official fixes per field).
+`--details` lists each conflicting record (and with `--deep`, what each loser loses).
+JSON keys: `conflicts`, `records`, `dirty`, `navmesh_cells`, `editor_id_duplicates`,
+`injected_collisions`, `reverted_fixes`, `overridden_patches`, `recommendations`.
+
+### eslify [options] [--configs] [--deep-configs] [--limit N] [--json]
+Light-plugin candidates: `flag` (as is), `flag-171` (needs header 1.71), `compact` /
+`compact-care` (needs FormID renumbering; risks listed: FaceGen, voice, SEQ, scripts, configs,
+dependents), `no` (worldspaces, cells without Engine Fixes 7.0.13+, too many records, master
+needing a regular plugin, SKSE DLL references, generated patches), `already` (flags invalid
+light plugins). `--configs` searches SKSE/INI/JSON configs that mention each plugin
+(`--deep-configs`: whole mod folders). Ends with a safe step-by-step procedure.
+
+### loot-update [SOURCE]
+Downloads LOOT's Skyrim SE masterlist (branch v0.29) or reads a local `masterlist.yaml`, and
+stores a compact copy in the cache; `loadorder`/`scan` use it instead of the bundled one. Needs
+PyYAML (`pip install pyyaml`).
 
 ---
 

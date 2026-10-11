@@ -522,6 +522,31 @@ def mark_deleted(plugin, rec):
     rec.touched()
 
 
+def restore_from_masters(lo, plugin, rec):
+    """Give a stripped deleted override (only a header, as the Creation Kit
+    writes deleted references) the fields of the latest version in the
+    plugin's masters, so it can be undeleted."""
+    idx = rec.formid >> 24
+    if idx >= len(plugin.masters):
+        raise EspError(f'{rec.label()} is not an override; nothing to restore it from')
+    owner = plugin.masters[idx]
+    objid = rec.formid & 0xFFFFFF
+    for m in reversed(plugin.masters):
+        mp = lo.get(m, required=False) if lo is not None else None
+        if mp is None:
+            continue
+        lf = lo.local_fid(mp, objid, owner)
+        src = mp.find(lf) if lf is not None else None
+        if src is None or src.flags & FLAG_DELETED:
+            continue
+        subs, _changed, _w = remap_record_fields(src, mp, mapper(mp, plugin), None, None, dst_plugin=plugin)
+        rec._subs = [x.copy() for x in subs]
+        rec.touched()
+        return m
+    raise EspError(f'cannot find an undeleted version of {rec.label()} in the masters of {plugin.name} '
+                   '(pass --data so they are found)')
+
+
 def undelete_and_disable(plugin, rec):
     """xEdit-style fix for deleted references: undelete, initially disable,
     enable parent = player (opposite), move far below the world."""

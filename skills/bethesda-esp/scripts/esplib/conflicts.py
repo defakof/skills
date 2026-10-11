@@ -264,7 +264,9 @@ class Scanner:
             udr = len(s.deleted_refs)
             dnav = len(s.deleted_navmeshes)
             if udr or dnav:
-                out[e.name] = {'udr': udr, 'deleted_navmesh': dnav}
+                out[e.name] = {'udr': udr, 'deleted_navmesh': dnav,
+                               'refs': [f'0x{f:08X}' for f in s.deleted_refs[:20]],
+                               'navmeshes': [f'0x{f:08X}' for f in s.deleted_navmeshes[:20]]}
         return out
 
     def navmesh_cells(self):

@@ -143,6 +143,28 @@ class TestLoadOrderModel(LoBase):
         after = [n for n in names if n not in moved]
         self.assertEqual(before, after)
 
+    def test_generated_patch_order(self):
+        from esplib import Plugin
+        root = os.path.join(self.tmp, 'gen')
+        shutil.copytree(self.root, root)
+        data = os.path.join(root, 'Data')
+        for n in ('Synthesis.esp', 'Synthesis_2.esp', 'Bashed Patch, 1.esp'):
+            p = Plugin.new(n, ['Skyrim.esm'])
+            p.path = os.path.join(data, n)
+            p.save(backup=False)
+        shutil.copy(os.path.join(data, 'Reverter.esp'), os.path.join(data, 'Reverter2.esp'))
+        with open(os.path.join(root, 'plugins.txt'), 'a') as f:
+            f.write('*Synthesis.esp\n*Reverter2.esp\n*Synthesis_2.esp\n*Bashed Patch, 1.esp\n')
+        want = ['Reverter2.esp', 'Bashed Patch, 0.esp', 'Bashed Patch, 1.esp', 'Synthesis.esp', 'Synthesis_2.esp']
+        for mlist_arg in (None, 'none'):
+            m = lorder.LoadOrderModel.from_sources(data=data, plugins_txt=os.path.join(root, 'plugins.txt'),
+                                                   userlist='', masterlist=mlist_arg)
+            codes = {i.code for i in m.validate()}
+            self.assertIn('generated-order', codes)
+            self.assertIn('synthesis-split', codes)
+            order, _moves, _ = m.sort()
+            self.assertEqual([e.name for e in order][-5:], want, mlist_arg)
+
     def test_sort_without_loot_data(self):
         m = self.model(masterlist='none')
         self.assertIsNone(m.meta)
@@ -364,7 +386,10 @@ class TestConflictScan(LoBase):
         over = sc.overridden_patches(confl)
         self.assertIn(('ModA - ModB Patch.esp', 'LateOverride.esp'), over)
         self.assertNotIn('Bashed Patch, 0.esp', [p for p, _w in over])     # generated patches are not "patches"
-        self.assertEqual(sc.dirty(), {'Dirty.esp': {'udr': 1, 'deleted_navmesh': 1}})
+        dirty = sc.dirty()
+        self.assertEqual(list(dirty), ['Dirty.esp'])
+        self.assertEqual((dirty['Dirty.esp']['udr'], dirty['Dirty.esp']['deleted_navmesh']), (1, 1))
+        self.assertEqual(len(dirty['Dirty.esp']['refs']), 1)
         self.assertEqual(len(sc.navmesh_cells()), 1)
         self.assertEqual([e for e, _w in sc.edid_duplicates()], ['SharedName'])
         _inj, coll = sc.injected()
@@ -432,6 +457,21 @@ class TestEslify(LoBase):
         self.assertEqual(res['LightMod.esp'].verdict, 'already')
         self.assertTrue(res['BadLight.esp'].risks)                         # flagged but invalid
         self.assertNotIn('Skyrim.esm', res)
+
+
+class TestUdrFix(LoBase):
+    def test_restore_and_disable(self):
+        work = os.path.join(self.tmp, 'udr')
+        shutil.copytree(self.data, work)
+        sc_dirty = conflicts.Scanner(self.model()).dirty()['Dirty.esp']
+        self.cli('delete', os.path.join(work, 'Dirty.esp'), *sc_dirty['refs'], '--disable')
+        from esplib import Plugin
+        p = Plugin.load(os.path.join(work, 'Dirty.esp'))
+        r = p.find(int(sc_dirty['refs'][0], 16))
+        self.assertFalse(r.flags & 0x20)                   # not deleted any more
+        self.assertTrue(r.flags & 0x800)                   # initially disabled
+        self.assertIsNotNone(r.get('NAME'))                # base object restored from Skyrim.esm
+        self.assertIsNotNone(r.get('XESP'))
 
 
 class TestCli(LoBase):

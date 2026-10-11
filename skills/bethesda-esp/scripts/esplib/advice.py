@@ -5,18 +5,29 @@ import re
 
 from .conflicts import CATEGORY_INFO, SEVERITY_RANK, UNOFFICIAL_PATCHES, relevant_tags
 
-# Tools we may recommend. Keep descriptions factual; see references/loadorder.md.
+# Tools we may recommend (status checked 2026-10; see references/loadorder.md).
 TOOLS = {
-    'loot': 'LOOT (sorts plugins with its masterlist; run it from your mod manager)',
-    'bashed': 'Wrye Bash Bashed Patch (merges leveled lists and tagged changes automatically)',
-    'smash': 'Mator Smash (field-level "smashed patch" of all conflicts; older tool, review its output)',
-    'synthesis': 'Synthesis (Mutagen) patchers, generated into Synthesis.esp',
-    'easynpc': 'EasyNPC (choose the appearance mod per NPC, keeps other mods\' NPC changes)',
-    'xedit': 'SSEEdit (xEdit) conflict view / manual patch',
-    'qac': 'SSEEdit Quick Auto Clean (removes ITMs, undeletes and disables deleted references)',
+    'loot': 'LOOT 0.29+ (sorts by its masterlist; run it through MO2 / use Vortex\'s built-in sort)',
+    'bashed': 'Wrye Bash 315+ Bashed Patch ("Bashed Patch, 0.esp"): Leveled Lists, Import Inventory/Outfits/'
+              'Actors/Cells/Stats/Names... driven by LOOT Bash Tags',
+    'synthesis': 'Synthesis 0.36+ (needs the .NET SDK; run through MO2; Synthesis.esp loads after the Bashed '
+                 'Patch, before DynDOLOD)',
+    'fusion': 'Synthesis Fusion Patcher (Nexus SSE 96297): Bash-Tag driven merge of lists, keywords, stats, '
+              'names... - the maintained alternative to Mator Smash',
+    'gsp': 'Generic Synthesis Patcher (Nexus SSE 130978): rule-based Fill / Forward / Merge',
+    'smash': 'Mator Smash - legacy: official 1.0.2 (2018) drops .esl plugins; only "Unofficial Mator Smash '
+             'Updated" (Nexus SSE 39378, 2021, predates header 1.71) works on SE; last resort, check in SSEEdit',
+    'easynpc': 'NPC Plugin Chooser 2 (Nexus SSE 157055, maintained) or EasyNPC (Nexus SSE 52313, unmaintained '
+               'since 2022): choose each NPC\'s appearance mod, keep the other mods\' NPC changes',
+    'facefixer': 'FaceFixer / FacegenBaseline (Synthesis patchers that forward face data; FaceGen files must '
+                 'come from the same mod)',
+    'kid': 'Keyword Item Distributor / Spell Perk Item Distributor (SKSE: add keywords/items/spells at '
+           'runtime, no plugin conflict)',
+    'xedit': 'SSEEdit 4.1.5+ (see every conflict with -vqsc through MO2; build a manual patch)',
+    'qac': 'SSEEdit Quick Auto Clean (SSEEdit -qac; one plugin at a time with only its masters loaded)',
     'ck': 'Creation Kit (Bethesda\'s editor: resave LE plugins; navmesh edits are made and finalized there)',
-    'eslifier': 'ESLifier (flags or compacts plugins and patches FaceGen, voice, scripts, SEQ, SKSE configs and '
-                'dependent plugins to match)',
+    'eslifier': 'ESLifier (Nexus SSE 145168, maintained): flags or compacts plugins and patches FaceGen, voice, '
+                'scripts, SEQ, SKSE configs and dependent plugins to match',
     'esp-eslify': 'esp eslify (this skill: lists ESL candidates and blockers) and esp esl <plugin> --flag',
     'bees': 'Backported Extended ESL Support (BEES, SKSE plugin for game 1.5.97-1.6.659)',
     'esp-merge': 'esp merge A.esp B.esp --into Patch.esp (this skill: 3-way merge of lists and changed fields)',
@@ -67,9 +78,11 @@ VALIDATION_ADVICE = {
     'loot-incompatible': (1, 'LOOT\'s masterlist says these two do not work together.', []),
     'undefined-group': (2, 'LOOT cannot sort while a plugin uses an undefined group.', ['loot']),
     'after-generated': (2, 'Generated patches only contain what loaded before them when they were built.',
-                        ['bashed', 'smash', 'synthesis', 'loot']),
+                        ['bashed', 'synthesis', 'loot']),
     'stale-patch': (2, 'Generated patches must be rebuilt after the mod list or order changes.',
-                    ['bashed', 'smash', 'synthesis']),
+                    ['bashed', 'synthesis']),
+    'generated-order': (2, 'Each generator only sees what loads before it.', ['bashed', 'synthesis', 'loot']),
+    'synthesis-split': (2, 'Synthesis expects its split files to be adjacent.', ['synthesis']),
     'dirty': (3, 'Deleted references and navmeshes can crash the game; ITMs revert other mods\' changes.', ['qac']),
     'bad-filename': (2, 'plugins.txt is Windows-1252; the game cannot activate names it cannot store.', []),
     'lo-desync': (3, 'Mod managers can overwrite one file from the other.', []),
@@ -201,7 +214,7 @@ def from_conflicts(conflicts, deep=False, scanner=None):
             why_bits.append(f'{len(patched)} already handled by a patch that has the others as masters')
         if not deep:
             why_bits.append('only the winner\'s version is used; run "esp scan --deep" to see whose changes are lost')
-        how, tools = _how(cat, todo, plugins, deep)
+        how, tools = _how(cat, todo, plugins, deep, tags)
         tagged = [(p, relevant_tags(cat, tags(p))) for p in plugins if p != winner]
         tagged = [(p, t) for p, t in tagged if t]
         if tagged:
@@ -217,21 +230,38 @@ def from_conflicts(conflicts, deep=False, scanner=None):
     if total_mergeable >= 15:
         out.append(Advice(3, 'whole-load-order-patch',
                           f'{total_mergeable} records are changed by 3+ mods each',
-                          'With this many overlapping list/stat edits, a generated patch is less work than hand-made '
-                          'ones.',
-                          ['Leveled lists / inventories: build a Bashed Patch in Wrye Bash (or esp merge ... --into '
-                           'Merged.esp for a handful of records).',
-                           'Stats, keywords and other fields across many mods: Mator Smash or Synthesis patchers; '
-                           'review the result in SSEEdit.',
-                           'Generated patches must load last and be rebuilt whenever the mod list changes.'],
-                          ['bashed', 'smash', 'synthesis', 'esp-merge']))
+                          'With this many overlapping list and field edits, generated patches are less work than '
+                          'hand-made ones.',
+                          ['Build a Bashed Patch first (Wrye Bash 315+): leveled lists, inventories, outfits, '
+                           'actor spells/perks/factions, and tagged stats, names and cell data.',
+                           'Then run Synthesis with Synthesis Fusion Patcher (unions keyword and item lists, uses '
+                           'the same Bash Tags) or Generic Synthesis Patcher for what the Bashed Patch does not '
+                           'cover. Synthesis.esp loads after the Bashed Patch.',
+                           'Mator Smash only as a last resort (see tools); never xEdit "Create Merged Patch" '
+                           '(obsolete).',
+                           'Important records (quests, scripts, perks, navmesh): hand-made patch '
+                           '(esp merge / esp copy, or SSEEdit).',
+                           'Generated patches load last (Bashed/Smashed, then Synthesis, then DynDOLOD) and must be '
+                           'rebuilt after any change to the mod list or order.'],
+                          ['bashed', 'synthesis', 'fusion', 'smash']))
     return out
 
 
-def _how(cat, cs, plugins, deep):
-    """Concrete steps for one conflict group."""
+def _lost_entries(cs):
+    """[(plugin, sig, kind, detail)] from deep results."""
+    out = []
+    for c in cs:
+        for l in (c.deep or {}).get('losers', []):
+            for sig, kind, det in l['lost']:
+                out.append((l['plugin'], sig, kind, det))
+    return out
+
+
+def _how(cat, cs, plugins, deep, tags=None):
+    """Concrete steps (and tools) for one conflict group."""
+    tags = tags or (lambda name: [])
     pl = ' '.join(_q(p) for p in plugins)
-    recs = ' '.join(c.formkey for c in cs[:6])
+    recs = ' '.join(c.formkey for c in cs[:6]) + (' ...' if len(cs) > 6 else '')
     kinds = set()
     npc_kind = set()
     for c in cs:
@@ -239,55 +269,107 @@ def _how(cat, cs, plugins, deep):
         kinds.add(d.get('status'))
         if d.get('npc'):
             npc_kind.add(d['npc'])
+    lost = _lost_entries(cs)
     merge_cmd = f'esp merge {pl} --into "Patch.esp" --records {recs}'
     if cat == 'navmesh':
-        return (['Navmeshes cannot be merged record-by-record. Use the compatibility patch from the mod pages if '
-                 'one exists; otherwise decide which mod\'s navmesh wins (load it last) or rebuild the overlap in the '
-                 'Creation Kit and finalize the navmesh.',
-                 'Deleted navmeshes are a crash risk and must be fixed by hand (xEdit/CK), not by cleaning tools.'],
+        return (['Not auto-mergeable (the Bashed Patch, Smash and Synthesis mergers all skip navmeshes). Use the '
+                 'navmesh patch from the mod pages if one exists; otherwise choose the winner by load order or '
+                 'build a navmesh patch in the Creation Kit.',
+                 'Deleted navmeshes are a crash risk and are not fixed by cleaning tools.'],
                 ['ck', 'xedit'])
     if cat == 'quests':
-        return (['Quest, dialogue, scene and package records carry scripts and conditions: look for an official '
-                 'compatibility patch first.',
-                 f'Otherwise compare in detail (esp diff / esp conflicts {pl} --details) and build a patch by hand: '
-                 'esp copy <winner> <record> --to Patch.esp, then forward the other mod\'s changes with esp set.'],
+        return (['Quests, dialogue, scenes and AI packages carry scripts (VMAD) and conditions that no automatic '
+                 'tool merges: use the authors\' compatibility patch if there is one.',
+                 f'Otherwise compare (esp conflicts {pl} --details) and patch by hand: esp copy <winner> <record> '
+                 '--to Patch.esp, then forward the other mod\'s changes with esp set (or in SSEEdit).'],
                 ['xedit', 'esp-copy'])
-    if cat in ('leveled', 'containers'):
-        return ([f'Merge the lists: {merge_cmd}',
-                 'Or let Wrye Bash build a Bashed Patch (merges every leveled list in the load order).'],
-                ['esp-merge', 'bashed'])
+    if cat == 'leveled':
+        steps = ['Build a Bashed Patch (Wrye Bash 315+, Leveled Lists): the standard merge for leveled lists; LOOT '
+                 'supplies the Delev/Relev tags.']
+        removers = sorted({p for p, sig, kind, det in lost if kind == 'list' and re.search(r' -[1-9]', det)})
+        untagged = [p for p in removers if 'Delev' not in tags(p)]
+        if untagged:
+            steps.append(f'{", ".join(untagged)} remove(s) entries but have no Delev tag: the Bashed Patch keeps '
+                         'removals only from Delev-tagged plugins (add the tag in Wrye Bash or in '
+                         'Data/BashTags/<plugin>.txt), or merge with esp merge, which keeps removals.')
+        steps.append(f'For a few records without Wrye Bash: {merge_cmd}')
+        steps.append('Alternatives: Synthesis Fusion Patcher or leveledlistresolver (not together with the Bashed '
+                     'Patch\'s leveled lists).')
+        return steps, ['bashed', 'esp-merge', 'fusion']
+    if cat == 'containers':
+        sigs = {c.sig for c in cs}
+        steps = []
+        if sigs & {'CONT', 'OTFT'}:
+            steps.append('Bashed Patch Import Inventory / Import Outfits (tags Invent.Add/Change/Remove, '
+                         'Outfits.Add/Remove) merges container and outfit contents.')
+        steps.append(f'Or merge directly: {merge_cmd} (form lists too, which the Bashed Patch does not merge)')
+        return steps, ['bashed', 'esp-merge', 'fusion']
     if cat == 'npc':
         if npc_kind and npc_kind <= {'visual'}:
-            return (['Appearance-only conflict: decide which mod\'s look you want and make sure that plugin wins '
-                     'AND its FaceGen files win in the mod manager (otherwise: dark-face bug).',
-                     'Many NPCs from several appearance mods: use EasyNPC.'], ['easynpc'])
-        steps = [f'Forward the non-visual changes (stats, perks, factions, inventory, AI) with {merge_cmd}']
+            return (['Appearance-only conflict: choose which mod\'s look each NPC gets with NPC Plugin Chooser 2 or '
+                     'EasyNPC. The winning record and its FaceGen files must come from the same mod, or the NPC '
+                     'gets the dark-face bug.',
+                     'One appearance mod should simply win: FaceFixer (Synthesis) forwards its face data onto '
+                     'the winning record; its FaceGen files must win in the mod manager too.'],
+                    ['easynpc', 'facefixer'])
+        steps = [f'Forward the non-appearance changes (stats, AI, factions, perks, inventory): {merge_cmd}',
+                 'Or Bashed Patch Import Actors / Factions / Perks / Spells / Inventory (Actors.*, NPC.*, '
+                 'Invent.* tags).']
         if 'mixed' in npc_kind or not deep:
-            steps.append('If an appearance mod is involved, keep its face data and FaceGen together: EasyNPC '
-                         'handles appearance vs. stats per NPC.')
-        return steps, ['esp-merge', 'easynpc', 'smash']
+            steps.append('If an appearance mod is involved, keep its face data and FaceGen together (NPC Plugin '
+                         'Chooser 2 / EasyNPC); the Bashed Patch cannot import faces for Skyrim.')
+        return steps, ['esp-merge', 'bashed', 'easynpc']
+    if cat in ('items', 'crafting'):
+        steps = []
+        if any(sig == 'KWDA' for _p, sig, _k, _d in lost):
+            steps.append('Keyword lists differ: union them with esp merge (keeps every mod\'s additions and '
+                         'removals) or Synthesis Fusion Patcher, or add keywords at runtime with KID. The Bashed '
+                         'Patch Keywords tag only lets the last tagged plugin win.')
+        steps.append(f'{"Fields" if steps else "Stats, names, models, sounds"}: {merge_cmd} (review with esp show)')
+        steps.append('Many records: Bashed Patch Import Stats / Names / Graphics / Sounds / Keywords with LOOT tags, '
+                     'or Synthesis Fusion Patcher.')
+        if 'clash' in kinds:
+            steps.append('Some fields were changed differently by each mod ("clash"): choose the value per field '
+                         'with esp set on the patch.')
+        return steps, ['esp-merge', 'bashed', 'fusion', 'kid']
+    if cat == 'magic':
+        return (['Perk entry points, conditions and magic effect scripts need a hand-made patch (esp copy + esp '
+                 'set, or SSEEdit).',
+                 f'Plain list/field changes: {merge_cmd}',
+                 'Stat-only changes: Bashed Patch EffectStats / SpellStats / EnchantmentStats tags.'],
+                ['esp-merge', 'xedit', 'bashed'])
+    if cat == 'actors':
+        return ([f'Forward the changes: {merge_cmd}',
+                 'Races: the Bashed Patch R.* tags cover spells, stats, skills, voices and body size; head data '
+                 'needs a hand-made patch. Factions: Relations.* tags.'],
+                ['esp-merge', 'bashed', 'xedit'])
     if cat == 'settings':
         return (['Only one value can win: the last plugin decides. Reorder if you prefer the other value, or set '
                  'it in a patch (esp copy ... --to Patch.esp; esp set Patch.esp <GMST> DATA=<value>).'],
                 ['esp-copy'])
     if cat == 'placed':
-        return (['Usually fine to let load order decide (one mod moves/edits the object). If one mod deletes or '
-                 'disables it and the other changes it, pick a winner by load order or patch by hand.'],
+        return (['Usually fine to let load order decide (one mod moves or edits the object). If one mod deletes '
+                 'or disables it and the other changes it, pick the winner by load order or patch by hand.'],
                 ['xedit'])
     if cat == 'landscape':
-        return (['Landscape edits from different mods do not merge well: choose the winner by load order or use a '
-                 'compatibility patch; seams/floating objects mean a patch is needed.'], ['xedit', 'ck'])
+        return (['Landscape edits do not merge: choose the winner by load order, use the authors\' patch, or a '
+                 'mod-specific Synthesis forwarder (e.g. Northern Roads Patcher); seams or floating objects mean '
+                 'a patch is needed.'], ['xedit', 'ck', 'synthesis'])
     if cat == 'cells':
-        return ([f'Forward the losing fields (lighting, water, name, location, music...): {merge_cmd}',
-                 'Lighting/weather overhauls often ship compatibility patches; check the mod pages first.'],
-                ['esp-merge', 'xedit'])
+        return ([f'Forward the losing fields (lighting, water, music, location, owner, name...): {merge_cmd}',
+                 'Or Bashed Patch Import Cells with C.* tags (C.Light, C.Water, C.Music, C.Location, C.Owner, '
+                 'C.Name...). Lighting/weather overhauls often ship compatibility patches; check the mod pages.'],
+                ['esp-merge', 'bashed'])
+    if cat == 'keywords':
+        return (['Keyword and action records rarely conflict meaningfully; the last plugin wins. Patch only if a '
+                 'mod needs its own version.'], ['esp-copy'])
     steps = [f'Small set: {merge_cmd} (review the result with esp show).']
     if 'clash' in kinds:
-        steps.append('Some fields were changed differently by each mod ("clash"): pick the value per field with '
+        steps.append('Some fields were changed differently by each mod ("clash"): choose the value per field with '
                      'esp set on the patch.')
-    steps.append('Many records across many mods: Mator Smash or Synthesis patchers, or Wrye Bash tags '
-                 '(Names, Stats, Keywords...).')
-    return steps, ['esp-merge', 'smash', 'synthesis', 'bashed']
+    steps.append('Many records across many mods: Synthesis Fusion Patcher / Generic Synthesis Patcher, or a '
+                 'hand-made patch in SSEEdit.')
+    return steps, ['esp-merge', 'fusion', 'gsp', 'xedit']
 
 
 def from_checks(dirty, navcells, edid_dups, collisions, reverts, scanner):
@@ -296,14 +378,18 @@ def from_checks(dirty, navcells, edid_dups, collisions, reverts, scanner):
         if d['deleted_navmesh']:
             out.append(Advice(1, 'dirty', f'{name} deletes {d["deleted_navmesh"]} navmesh(es)',
                               'Deleted navmeshes can crash the game when the area loads.',
-                              ['Check the LOOT masterlist / mod page for a fixed version; otherwise fix in SSEEdit '
-                               '(replace the deleted navmesh) or the Creation Kit. Cleaning tools do not fix this.'],
+                              ['Check LOOT\'s messages and the mod page for a fixed version; otherwise repair it '
+                               'by hand (SSEEdit or the Creation Kit). Quick Auto Clean does not fix deleted '
+                               f'navmeshes. Records: {", ".join(d.get("navmeshes", [])[:8])}'],
                               ['xedit', 'ck'], [name]))
         if d['udr']:
             out.append(Advice(2, 'dirty', f'{name} deletes {d["udr"]} placed reference(s)',
                               'Deleted references (UDRs) can crash the game when other mods or scripts touch them.',
-                              [f'Undelete and disable them: esp delete {_q(name)} <ref> --disable for each, or run '
-                               'SSEEdit Quick Auto Clean (only if LOOT says the plugin should be cleaned).'],
+                              [f'Run SSEEdit Quick Auto Clean on {name} alone (only its masters loaded); first '
+                               'check LOOT\'s messages for it - a few plugins must not be cleaned.',
+                               f'Or fix them here: esp delete {_q(name)} {" ".join(d.get("refs", [])[:8])} --disable '
+                               '(restores each reference from its master, then undeletes and disables it the way '
+                               'xEdit does).'],
                               ['qac'], [name]))
     for cell, ents in navcells:
         names = [e.name for e in ents]

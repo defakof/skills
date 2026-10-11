@@ -4,7 +4,7 @@ Agent skills for **Claude Code** and **Google Antigravity**.
 
 | Skill | What it does |
 |---|---|
-| [`bethesda-esp`](skills/bethesda-esp/SKILL.md) | Read, edit and patch Skyrim Special Edition plugin files (`.esp` / `.esm` / `.esl`) from the command line: an xEdit-style toolkit your agent can drive |
+| [`bethesda-esp`](skills/bethesda-esp/SKILL.md) | Read, edit and patch Skyrim Special Edition plugin files (`.esp` / `.esm` / `.esl`), check and sort load orders, scan them for conflicts and plan the fixes: an xEdit + LOOT style toolkit your agent can drive |
 
 ---
 
@@ -20,6 +20,9 @@ safely. Ask things like:
 - *"Make `MyPatch.esp` an ESL. Is it eligible?"*
 - *"Clean the ITMs from this plugin."* / *"Remove this placed rock without breaking the game."*
 - *"Add a recipe at the forge that turns 2 iron ingots into a steel dagger."*
+- *"Check my MO2 profile's load order and fix what's wrong."* / *"Why does LOOT put this plugin there?"*
+- *"Scan my load order for conflicts. What needs a patch, a Bashed Patch, Synthesis or EasyNPC?"*
+- *"I'm at 250 plugins. Which ones can I ESL-flag safely?"*
 
 ### What's included
 
@@ -30,6 +33,16 @@ safely. Ask things like:
   xEdit-style disable for references), `merge` (Bashed-patch-style 3-way merge of leveled lists,
   inventories, keywords and changed fields), `conflicts`, `diff`, `itm`, `masters`, `esl`,
   `compact`, `delocalize`, `verify`, `schema`, `tree`, `strings`, `bsa`.
+- Whole-load-order analysis (plugins, not archives): `loadorder` (reads plugins.txt or an MO2
+  profile; applies the game's rules - hardcoded and Creation Club plugins, masters first,
+  hoisting, 254/4096 slots, header 1.71 vs game version - and LOOT's masterlist and userlist
+  rules, groups, dirty-plugin CRCs and warnings; suggests the smallest set of moves and explains
+  each), `scan` (every record several mods override, field-level with `--deep`; patches that
+  lose, reverted official/USSEP fixes, navmesh overlaps, deleted references and navmeshes;
+  prioritized fixes naming the right tool: compatibility patch, `esp merge`, Bashed Patch,
+  Synthesis (Fusion Patcher), NPC Plugin Chooser 2 / EasyNPC, Creation Kit, Mator Smash as a
+  last resort) and `eslify` (flag-only vs compaction candidates and what compaction would break).
+  Header scans are cached, so a 1,000-plugin load order rescans in seconds.
 - `scripts/esplib/`: the library behind it, usable from Python for bulk edits.
 - Field layouts for 115 Skyrim SE record types (weapons, armor, NPCs, leveled lists, recipes,
   containers, spells, effects, perks, cells, references, worldspaces, dialogue, quests...), Papyrus
@@ -37,8 +50,9 @@ safely. Ask things like:
 - Localized strings from loose `Strings/` files **or straight out of BSAs** (Skyrim SE LZ4 and LE
   zlib archives, read with a pure-Python LZ4 decoder).
 - Docs the agent reads on demand: command reference, record field guide, file format primer,
-  Python API, and an optional [Spriggit](https://github.com/Mutagen-Modding/Spriggit) workflow
-  for full-schema YAML editing of the record types kept as raw bytes.
+  Python API, a load-order and conflict-resolution guide (which tool for which conflict, tool
+  status as of 2026), and an optional [Spriggit](https://github.com/Mutagen-Modding/Spriggit)
+  workflow for full-schema YAML editing of the record types kept as raw bytes.
 
 ### Safety
 
@@ -116,6 +130,9 @@ python $esp set MyMod.esp IronSword DATA.damage=12 KWDA+=WeapMaterialSteel
 python $esp conflicts ModA.esp ModB.esp --details
 python $esp merge ModA.esp ModB.esp --into "ModA - ModB Patch.esp"
 python $esp esl MyPatch.esp --flag
+python $esp loadorder --mo2 "D:/MO2/profiles/Default" --groups
+python $esp scan --plugins-txt "%LOCALAPPDATA%/Skyrim Special Edition/Plugins.txt" --data "D:/Skyrim Special Edition/Data" --deep
+python $esp eslify --mo2 "D:/MO2/profiles/Default" --configs
 ```
 
 ### Limits
@@ -125,7 +142,10 @@ python $esp esl MyPatch.esp --flag
 - Navmeshes, terrain (LAND), and some fields of RACE, QUST aliases, PACK, SCEN, PERK entry points
   and weather colors are preserved but shown as raw bytes. Use the Spriggit workflow for those.
 - It edits plugins, not assets: no FaceGen generation, script compilation, mesh or texture editing.
-- Load order sorting is LOOT's job; this tool reads `plugins.txt` but doesn't reorder it.
+- Load order: the sort follows LOOT's rules and metadata but is not a byte-for-byte LOOT clone
+  (no BSA-content overlap rule, inactive plugins are not sorted). It writes a suggested
+  plugins.txt only when asked (`--write`); applying it through LOOT/MO2/Vortex is recommended.
+- Loose-file and BSA asset conflicts (mod manager priority) are not analysed.
 
 ### Credits
 
@@ -136,13 +156,20 @@ python $esp esl MyPatch.esp --flag
   implementation to validate this tool, and recommended for full-schema edits. Condition-function
   and actor-value index tables were cross-checked against Mutagen's.
 - [testing-plugins](https://github.com/Ortham/testing-plugins) by Oliver Hamlet (LOOT): test plugins.
+- [LOOT](https://loot.github.io/) and its [Skyrim SE masterlist](https://github.com/loot/skyrimse)
+  (CC0 1.0): a compact copy ships in `esplib/data/loot_skyrimse.json.gz`; the sorting rules follow
+  libloot's documented behaviour and [libloadorder](https://github.com/Ortham/libloadorder)'s
+  description of how the game reads plugins.txt.
 
 ### Development
 
 ```bash
 python -m unittest discover tests -v       # stdlib only
 ```
-`tests/fixtures/` were generated with Mutagen (see `tests/README.md`). Layouts live in
+`tests/fixtures/` were generated with Mutagen (see `tests/README.md`); the load-order scenario is
+built at test time by `tests/tools/make_lo_fixture.py`. Refresh the bundled LOOT data with
+`esp loot-update` (writes to the cache) or by converting a new masterlist with
+`esplib.masterlist.compact_metadata`. Layouts live in
 `skills/bethesda-esp/scripts/esplib/schema_sse.py`. Add a record type with `R('SIG', 'Name', {...})`;
 `esp verify --roundtrip` and the decode self-check flag any mistake.
 

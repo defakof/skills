@@ -465,6 +465,9 @@ def cmd_delete(args):
     if args.mark or args.disable:
         for r in recs:
             if args.disable:
+                if r.flags & core.FLAG_DELETED and r.get('NAME') is None:
+                    src = ops.restore_from_masters(lo, p, r)
+                    say(f'restored fields of {r.label()} from {src}')
                 ops.undelete_and_disable(p, r)
                 say(f'disabled {header_line(lo, p, r)}')
             else:

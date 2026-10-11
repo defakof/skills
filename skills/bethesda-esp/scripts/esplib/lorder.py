@@ -60,8 +60,23 @@ LATE_LOADERS = [
     (r'^(parallaxgen|pg_\d+)\.esp$', 'ParallaxGen output'),
     (r'^dyndolod.*\.es[mp]$', 'DynDOLOD output'),
     (r'^occlusion\.esp$', 'DynDOLOD/xLODGen occlusion'),
+    (r'^npc appearances merged\.esp$', 'EasyNPC output'),
 ]
 GENERATED_GROUPS = ('Dynamic Patches', 'Late Fixes & Changes', 'Dynamic LOD')
+# Build/load order of generated patches: Bashed/Smashed, then Synthesis, then LOD.
+GENERATED_RANK = [
+    (r'^(bashed patch.*|smashed patch.*|zpatch.*|sse ?merged)\.esp$', 1, 'Bashed/Smashed patches'),
+    (r'^(synthesis.*|parallaxgen|pg_\d+)\.esp$', 2, 'Synthesis / ParallaxGen output'),
+    (r'^(dyndolod.*\.es[mp]|occlusion\.esp)$', 3, 'DynDOLOD / occlusion'),
+]
+
+
+def generated_rank(name):
+    n = name.lower()
+    for rx, rank, label in GENERATED_RANK:
+        if re.match(rx, n):
+            return rank, label
+    return None, None
 
 # Game versions: native support for header 1.71 / small ESL FormIDs.
 V_CREATIONS = (1, 6, 1130)
@@ -554,7 +569,16 @@ class LoadOrderModel:
         return 254 if any(self.is_light(e) for e in order) else 255
 
     def group_of(self, e):
-        return self.meta.for_plugin(e.name).group if self.meta else None
+        """LOOT group; generated patches the masterlist does not know by name
+        (Synthesis_2.esp, Bashed Patch, 1.esp...) get their tool's group."""
+        if not self.meta:
+            return None
+        g = self.meta.for_plugin(e.name).group
+        if g == 'default':
+            rank, _label = generated_rank(e.name)
+            if rank:
+                g = GENERATED_GROUPS[rank - 1]
+        return g
 
     def is_generated(self, e):
         if late_loader_reason(e.name):
@@ -736,6 +760,19 @@ class LoadOrderModel:
         gen = [i for i, e in enumerate(order) if self.is_generated(e)]
         if not gen:
             return out
+        ranked = [(order[i], generated_rank(order[i].name)) for i in gen
+                  if generated_rank(order[i].name)[0] and not self.is_master_like(order[i])]
+        for (a, (ra, la)), (b, (rb, lb)) in zip(ranked, ranked[1:]):
+            if rb < ra:
+                out.append(Issue('warning', 'generated-order', b.name,
+                                 f'{b.name} ({lb}) loads after {a.name} ({la}); generated patches are built and '
+                                 'loaded in the order Bashed/Smashed patch, Synthesis, DynDOLOD',
+                                 f'Move {b.name} above {a.name} and rebuild the later ones.', [a.name]))
+        syn = [i for i in gen if re.match(r'^synthesis(_\d+)?\.esp$', order[i].name.lower())]
+        if len(syn) > 1 and syn[-1] - syn[0] != len(syn) - 1:
+            out.append(Issue('warning', 'synthesis-split', order[syn[0]].name,
+                             'Synthesis split files (Synthesis.esp, Synthesis_2.esp...) must load next to each '
+                             'other', 'Move them together, in order.', [order[i].name for i in syn]))
         first = gen[0]
         late = [e for e in order[first + 1:] if not self.is_generated(e) and not e.implicit
                 and not self.is_master_like(e)]
@@ -926,7 +963,7 @@ class LoadOrderModel:
             # 4. groups (soft). Edges from plugins in "default" are added last so
             #    that relationships between named groups win, as in LOOT.
             if meta is not None:
-                grp = {e.low: meta.for_plugin(e.name).group for e in part}
+                grp = {e.low: self.group_of(e) for e in part}
                 for g in grp.values():
                     if not meta.group_exists(g):
                         notes.append(f'group "{g}" does not exist; treated as default')
@@ -951,6 +988,12 @@ class LoadOrderModel:
                     for n in topo.order[:]:
                         if n != ll and n not in late:
                             topo.add(n, ll, f'{names[ll].name} is a {why} and should load last')
+                for a in late:
+                    for b in late:
+                        ra, la = generated_rank(names[a].name)
+                        rb, _lb = generated_rank(names[b].name)
+                        if ra and rb and ra < rb:
+                            topo.add(a, b, f'{la} load before {names[b].name}')
             # 5. overlap: the plugin that overrides more records loads first
             for (a, b), shared in sorted(pairs.items()):
                 if a not in members or b not in members:
@@ -964,7 +1007,7 @@ class LoadOrderModel:
                 topo.add(first, second,
                          f'overlap: both override {shared} record(s); {names[first].name} overrides more records '
                          f'({max(ca, cb)} vs {min(ca, cb)}), so the smaller {names[second].name} wins')
-            new_order = [names[n] for n in topo.order]
+            new_order = [names[n] for n in topo.stable_order({e.low: i for i, e in enumerate(part)})]
             moves += _explain_moves(part, new_order, topo)
             result += new_order
         hoisted = self._hoist(result)
@@ -1023,6 +1066,25 @@ class DynTopo:
         self.pred[v].add(u)
         self.reasons[(u, v)] = reason
         return True
+
+    def stable_order(self, rank):
+        """Topological order of the accepted edges that keeps the original
+        order wherever the edges allow (Kahn's algorithm, lowest rank first)."""
+        import heapq
+        indeg = {n: len(self.pred[n]) for n in self.order}
+        heap = [(rank[n], n) for n in self.order if not indeg[n]]
+        heapq.heapify(heap)
+        out = []
+        while heap:
+            _r, n = heapq.heappop(heap)
+            out.append(n)
+            for w in self.succ[n]:
+                indeg[w] -= 1
+                if not indeg[w]:
+                    heapq.heappush(heap, (rank[w], w))
+        if len(out) != len(self.order):        # cannot happen: edges are acyclic
+            return list(self.order)
+        return out
 
 
 def _lcs_keep(a, b):
