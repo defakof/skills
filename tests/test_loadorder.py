@@ -201,6 +201,16 @@ class TestLoadOrderModel(LoBase):
         _o, moves2, _ = m2.sort()
         self.assertEqual(moves2, [])                                   # sorting the result changes nothing
 
+    def test_duplicate_line_last_wins(self):
+        path = os.path.join(self.tmp, 'dup.txt')
+        with open(self.ptxt) as f:
+            text = f.read()
+        with open(path, 'w') as f:
+            f.write(text + 'SmallTweak.esp\n')          # listed again at the end, inactive
+        m = lorder.LoadOrderModel.from_sources(data=self.data, plugins_txt=path, userlist='')
+        self.assertFalse(m.by_name()['smalltweak.esp'].active)
+        self.assertIn('duplicate-entry', [i.code for i in m.validate()])
+
     def test_plugins_txt_parsing(self):
         path = os.path.join(self.tmp, 'p.txt')
         with open(path, 'wb') as f:
@@ -302,6 +312,26 @@ plugins:
         self.assertLess(names.index('NeedsCompact.esp'), names.index('Eslable.esp'))
         self.assertGreater(names.index('SmallTweak.esp'), names.index('Reverter.esp'))     # "My Late" after default
         self.assertTrue(any('Nope' in n for n in notes))
+
+    def test_bash_tags_and_loot_cycle(self):
+        ul = self.userlist("""
+plugins:
+  - name: 'ModB.esp'
+    tag: [ Relev, Names ]
+  - name: 'LateMaster.esm'
+    after: [ 'SmallTweak.esp' ]
+""")
+        bt = os.path.join(self.data, 'BashTags')
+        os.makedirs(bt, exist_ok=True)
+        try:
+            with open(os.path.join(bt, 'ModB.txt'), 'w') as f:
+                f.write('Delev, -Names\n')
+            m = self.model(userlist=ul)
+            self.assertEqual(m.tags_of(m.by_name()['modb.esp']), ['Delev', 'Relev'])
+            codes = [(i.code, i.plugin) for i in m.validate()]
+            self.assertIn(('loot-cannot-sort', 'LateMaster.esm'), codes)
+        finally:
+            shutil.rmtree(bt)
 
     def test_conditions(self):
         m = self.model()

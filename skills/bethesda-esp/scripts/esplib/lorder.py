@@ -159,6 +159,8 @@ def appdata_folder(game_dir=None):
     """The %LOCALAPPDATA% folder name the game uses (Steam / GOG / Epic / MS Store)."""
     if game_dir and os.path.isdir(game_dir):
         names = {n.lower() for n in os.listdir(game_dir)}
+        if 'skyrimvr.exe' in names:
+            return 'Skyrim VR'
         if 'galaxy64.dll' in names:
             return 'Skyrim Special Edition GOG'
         if 'eossdk-win64-shipping.dll' in names:
@@ -279,6 +281,7 @@ class LoadOrderModel:
         self.data_dir = None
         self.game_dir = None
         self.game_version = None   # SkyrimSE.exe file version tuple, if found
+        self.is_vr = False         # SkyrimVR.exe next to the Data folder
         self.source_desc = ''
         self.manager = None        # 'MO2' | 'Vortex' | None
         self.issues = []
@@ -321,9 +324,12 @@ class LoadOrderModel:
             lo.search_dirs.append((lo.data_dir, 'Data'))
             lo.game_dir = os.path.dirname(lo.data_dir)
             exe = os.path.join(lo.game_dir, 'SkyrimSE.exe')
+            vr_exe = os.path.join(lo.game_dir, 'SkyrimVR.exe')
             if os.path.isfile(exe):
                 pv = mlist.pe_version(exe)
                 lo.game_version = pv[0] if pv else None
+            elif os.path.isfile(vr_exe):
+                lo.is_vr = True
         if plugins:
             # explicit list: files or names, in load order, all active
             for p in plugins:
@@ -376,7 +382,7 @@ class LoadOrderModel:
         if ccc and os.path.isfile(ccc):
             lo.ccc = read_ccc(ccc)
             lo.ccc_source = ccc
-        elif lo.data_dir:
+        elif lo.data_dir and not lo.is_vr:
             lo.ccc = list(CCC_FALLBACK)
             lo.ccc_source = 'built-in copy (Skyrim.ccc not found)'
         lo._build_entries(listed)
@@ -442,7 +448,8 @@ class LoadOrderModel:
         seen = {}
         entries = []
         # implicit plugins: hardcoded, then CC plugins in Skyrim.ccc order (incl. _ResourcePack.esl)
-        implicit = [(h, 'hardcoded') for h in HARDCODED] + [(c, 'cc') for c in self.ccc]
+        hard = HARDCODED + (['SkyrimVR.esm'] if self.is_vr else [])
+        implicit = [(h, 'hardcoded') for h in hard] + [(c, 'cc') for c in self.ccc]
         for name, kind in implicit:
             if name.lower() in seen:
                 continue
@@ -457,12 +464,11 @@ class LoadOrderModel:
             low = name.lower()
             if low in seen:
                 e = seen[low]
-                if e.listed is None:
-                    e.listed = i
-                    if e.implicit is None:
-                        e.active = active
-                else:
-                    dup.add(name)
+                if e.listed is not None:
+                    dup.add(name)           # the game uses the last line
+                e.listed = i
+                if e.implicit is None:
+                    e.active = active
                 continue
             path, label = self.find_path(name)
             e = Entry(name, path, active, i, None, label)
@@ -510,7 +516,8 @@ class LoadOrderModel:
         .esm/.esl) before regular plugins, and any plugin that a master
         depends on hoisted to just before it, as the game does."""
         act = self.active()
-        hard = sorted([e for e in act if e.implicit == 'hardcoded'], key=lambda e: HARDCODED_LOW.index(e.low))
+        hard = sorted([e for e in act if e.implicit == 'hardcoded'],
+                      key=lambda e: HARDCODED_LOW.index(e.low) if e.low in HARDCODED_LOW else len(HARDCODED_LOW))
         cc = [e for e in act if e.implicit == 'cc']
         rest = [e for e in act if not e.implicit]
         rest.sort(key=lambda e: e.listed if e.listed is not None else 10 ** 6)
@@ -586,9 +593,18 @@ class LoadOrderModel:
         return bool(self.meta and self.group_of(e) in GENERATED_GROUPS)
 
     def tags_of(self, e):
-        if not self.meta:
-            return []
-        return mlist.bash_tags(self.meta.for_plugin(e.name), self.ev, e.scan.description if e.scan else '')
+        """Bash Tags (plugin description, LOOT metadata, Data/BashTags/<plugin>.txt)."""
+        lines = None
+        if self.search_dirs:
+            p = self.ev.find('BashTags/' + os.path.splitext(e.name)[0] + '.txt')
+            if p:
+                try:
+                    with open(p, encoding='utf-8-sig', errors='replace') as f:
+                        lines = f.read().splitlines()
+                except OSError:
+                    lines = None
+        return mlist.bash_tags(self.meta.for_plugin(e.name) if self.meta else None, self.ev,
+                               e.scan.description if e.scan else '', lines)
 
     # -- validation -----------------------------------------------------------
     def validate(self):
@@ -709,6 +725,16 @@ class LoadOrderModel:
                                         'Keep new cells in a full (non-ESL) plugin.'))
             if pmeta is not None:
                 issues += self._meta_issues(e, pmeta)
+                if self.is_master_like(e):
+                    for name, _item, src in mlist.evaluate_items(pmeta.req + pmeta.after, self.ev):
+                        te = names.get(name.lower())
+                        if te is not None and te.scan is not None and not self.is_master_like(te):
+                            issues.append(Issue('warning', 'loot-cannot-sort', e.name,
+                                                f'{e.name} is a master but LOOT {src} metadata makes it load after '
+                                                f'the regular plugin {te.name}; LOOT stops with a "cyclic '
+                                                'interaction" error while both are installed',
+                                                'Remove that load-after/requirement rule from the userlist, or '
+                                                'disable one of the plugins.', [te.name]))
         # limits
         max_full = 254 if n_light else 255
         if n_full > max_full:
@@ -723,8 +749,14 @@ class LoadOrderModel:
         if n_light > 4096:
             issues.append(Issue('error', 'too-many-light', None, f'{n_light} light plugins active; limit is 4096',
                                 'Merge some light plugins.'))
+        # Skyrim VR loads light plugins only with Skyrim VR ESL Support
+        if self.is_vr and n_light and self.ev.find('SKSE/Plugins/skyrimvresl.dll') is False:
+            issues.append(Issue('error', 'vr-no-esl', None,
+                                f'{n_light} light plugin(s) are active but Skyrim VR needs the Skyrim VR ESL Support '
+                                'SKSE plugin (Data/SKSE/Plugins/skyrimvresl.dll) to load them',
+                                'Install Skyrim VR ESL Support (Nexus SSE 106712) or remove the ESL flags.'))
         # header 1.71 needs game 1.6.1130+ or BEES
-        if hedr171:
+        if hedr171 and not self.is_vr:
             names_s = ', '.join(hedr171[:5]) + (' ...' if len(hedr171) > 5 else '')
             if self.game_version and tuple(self.game_version[:3]) < V_CREATIONS:
                 bees = self.ev.find('SKSE/Plugins/BackportedESLSupport.dll')

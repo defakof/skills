@@ -907,25 +907,38 @@ def evaluate_items(items, ev):
     return out
 
 
-def bash_tags(meta, ev, description=''):
-    """Bash Tags from the masterlist plus {{BASH:...}} in the plugin description;
-    '-Tag' removes a tag."""
-    add, remove = [], set()
-    for t in meta.tags:
+def bash_tags(meta, ev, description='', tags_file=None):
+    """Effective Bash Tags, in Wrye Bash's priority order: {{BASH:...}} in the
+    plugin description, then LOOT masterlist/userlist tags, then the lines of
+    Data/BashTags/<plugin>.txt. '-Tag' removes a tag set by an earlier source."""
+    tags = set()
+
+    def apply(names):
+        for name in names:
+            name = name.strip()
+            if not name:
+                continue
+            if name.startswith('-'):
+                tags.discard(name[1:].strip())
+            else:
+                tags.add(name)
+
+    m = re.search(r'\{\{\s*BASH\s*:([^}]*)\}\}', description or '', re.I)
+    if m:
+        apply(m.group(1).split(','))
+    loot = []
+    for t in (meta.tags if meta is not None else []):
         if isinstance(t, list):
             name, cond = t
             if ev.eval(cond) is not True:
                 continue
         else:
             name = t
-        if name.startswith('-'):
-            remove.add(name[1:])
-        else:
-            add.append(name)
-    m = re.search(r'\{\{\s*BASH\s*:([^}]*)\}\}', description or '', re.I)
-    if m:
-        add += [t.strip() for t in m.group(1).split(',') if t.strip()]
-    return sorted(set(add) - remove)
+        loot.append(name)
+    apply(loot)
+    for line in tags_file or []:
+        apply(line.split('#', 1)[0].split(','))
+    return sorted(tags)
 
 
 # ---------------------------------------------------------------------------
