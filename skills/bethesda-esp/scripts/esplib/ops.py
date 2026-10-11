@@ -676,7 +676,7 @@ def esl_report(plugin):
     warn = []
     if cells:
         warn.append(f'{len(cells)} new CELL record(s): in a light plugin, new cells overridden by other plugins '
-                    'lose temporary references and interior cells reload wrongly unless SSE Engine Fixes 7.0.13+ '
+                    'lose temporary references and interior cells reload wrongly unless SSE Engine Fixes 7.0.14+ '
                     '(bESLCELLLoadBug) is installed')
     if worlds:
         warn.append(f'{len(worlds)} new WRLD record(s): light plugins can lose the landscape of new worldspaces '

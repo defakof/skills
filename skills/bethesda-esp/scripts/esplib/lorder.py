@@ -818,6 +818,11 @@ class LoadOrderModel:
                 own_ids = s.new_ids()
                 lo_bound = 0x000 if s.hedr_version >= 1.705 else 0x800
                 bad = [i for i in own_ids if i < lo_bound or i > 0xFFF]
+                if s.hedr_version >= 1.705 and 0 in own_ids:
+                    issues.append(Issue('warning', 'esl-id-zero', e.name,
+                                        f'{e.name} has a new record with object ID 000; ID 0 belongs to the plugin '
+                                        'header, and xEdit and current ESLifier only use 001-FFF',
+                                        'Compact it again with an up-to-date tool (ESLifier 0.17+ or SSEEdit 4.1.5+).'))
                 if bad:
                     issues.append(Issue('error', 'esl-range', e.name,
                                         f'{e.name} is a light plugin but {len(bad)} new record(s) have object IDs '
@@ -829,9 +834,9 @@ class LoadOrderModel:
                     issues.append(Issue('warning', 'esl-new-cell', e.name,
                                         f'{e.name} is a light plugin that adds {new_cells} new CELL record(s); '
                                         'such cells lose temporary references when other plugins override them '
-                                        'and interior cells reload wrongly, unless SSE Engine Fixes 7.0.13+ '
+                                        'and interior cells reload wrongly, unless SSE Engine Fixes 7.0.14+ '
                                         '(bESLCELLLoadBug) is installed',
-                                        'Install SSE Engine Fixes 7.0.13+, or keep new cells in a full (non-ESL) '
+                                        'Install SSE Engine Fixes 7.0.14+, or keep new cells in a full (non-ESL) '
                                         'plugin.'))
             if pmeta is not None:
                 issues += self._meta_issues(e, pmeta)

@@ -238,7 +238,7 @@ JSON keys: `conflicts`, `records`, `dirty`, `navmesh_cells`, `editor_id_duplicat
 ### eslify [options] [--configs] [--deep-configs] [--limit N] [--json]
 Light-plugin candidates: `flag` (as is), `flag-171` (needs header 1.71), `compact` /
 `compact-care` (needs FormID renumbering; risks listed: FaceGen, voice, SEQ, scripts, configs,
-dependents), `no` (worldspaces, cells without Engine Fixes 7.0.13+, too many records, master
+dependents), `no` (worldspaces, cells without Engine Fixes 7.0.14+, too many records, master
 needing a regular plugin, SKSE DLL references, generated patches), `already` (flags invalid
 light plugins). `--configs` searches SKSE/INI/JSON configs that mention each plugin
 (`--deep-configs`: whole mod folders). Ends with a safe step-by-step procedure.

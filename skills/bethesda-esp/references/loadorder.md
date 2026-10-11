@@ -209,10 +209,14 @@ load order** and must:
 
 - **flag** - every new record already fits the light range: set the ESL flag
   (`esp esl X.esp --flag`). No FormIDs change, dependents keep working. Remaining risks: scripts
-  that use `GetModByName` (it does not see light plugins), SEQ files (dialogue may need a save
+  that use `GetModByName` (it returns 0x100 or more for light plugins, so scripts comparing it with
+  255 or building FormIDs from it break), SEQ files (dialogue may need a save
   and reload), and changing plugins under an ongoing save is disputed - do it before a playthrough.
 - **flag-171** - fits only the 1.71 range: `esp esl X.esp --header-171 --flag` (game 1.6.1130+
-  or BEES; the plugin and its dependents need Skyrim.esm as a master and header 1.71).
+  or BEES; the plugin needs Skyrim.esm as a master, its dependents need header 1.71, and no
+  dependent may list it as its first master - there IDs 001-7FF would read as hardcoded engine
+  forms). ESLifier writes header 1.71 even when only flagging; turn that option off on games
+  older than 1.6.1130 without BEES.
 - **compact / compact-care** - needs FormID compaction (renumbering). That breaks existing saves
   and everything that names the FormIDs: FaceGen files (dark faces), voice files (silent lines),
   SEQ files, `GetFormFromFile` in scripts, SKSE configs (SPID/KID/BOS/OAR/DAR...), dependent
@@ -221,7 +225,7 @@ load order** and must:
   `esp compact` / xEdit's "Compact FormIDs for ESL" only renumber the plugin itself - only for
   `compact` plugins with nothing depending on them, and only for a new game.
 - **no** - too many records, new worldspaces (lose landscape when light), new cells without SSE
-  Engine Fixes 7.0.13+ (cells lose temporary references / reload wrongly), a master that needs a
+  Engine Fixes 7.0.14+ (cells lose temporary references / reload wrongly), a master that needs a
   regular plugin, SKSE DLLs that hard-code its FormIDs, generated patches (use the tool's own
   ESL option).
 

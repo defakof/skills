@@ -17,7 +17,7 @@ CONFIG_EXTS = ('.ini', '.json', '.toml', '.yaml', '.yml', '.txt', '.jslot', '.ps
 MAX_CONFIG_SIZE = 4 * 1024 * 1024
 MAX_DLL_SIZE = 64 * 1024 * 1024
 V_CREATIONS = (1, 6, 1130)
-V_EF_CELL_FIX = (7, 0, 13)
+V_EF_CELL_FIX = (7, 0, 14)
 
 VERDICTS = ('flag', 'flag-171', 'compact', 'compact-care', 'no', 'already')
 
@@ -113,7 +113,8 @@ def _check_file(path, needle, hits):
 def _scripts_mention(dirs, plugin_name, limit=20):
     """Compiled scripts (.pex) naming the plugin: [(path, uses GetFormFromFile,
     uses GetModByName)]. Hard-coded FormIDs break when the plugin is compacted;
-    GetModByName does not find light plugins."""
+    GetModByName returns 0x100+ for light plugins, which breaks scripts that
+    compare it with 255 or build FormIDs from it."""
     needle = plugin_name.lower().encode('utf-8')
     hits = []
     for base in dirs:
@@ -217,7 +218,7 @@ def _game_supports_171(model):
 
 
 def _engine_fixes_cell_fix(model):
-    """True if SSE Engine Fixes 7.0.13+ (fixes the ESL cell bugs) is installed,
+    """True if SSE Engine Fixes 7.0.14+ (fixes the ESL cell bugs) is installed,
     False if it is not, None if unknown."""
     if not model.search_dirs:
         return None
@@ -304,10 +305,10 @@ def analyse(model, configs=False, deep_configs=False):
                 ef_fix = _engine_fixes_cell_fix(model)
             cell_note = (f'adds {new_sigs["CELL"]} new cell(s): light plugins lose temporary references in new cells '
                          'that other plugins override, and interior cells reload wrongly; SSE Engine Fixes '
-                         '7.0.13+ (bESLCELLLoadBug) fixes this')
+                         '7.0.14+ (bESLCELLLoadBug) fixes this')
             if ef_fix is not True:
                 c.verdict = 'no'
-                c.reasons.append(cell_note + ('; Engine Fixes 7.0.13+ was not found' if ef_fix is False else
+                c.reasons.append(cell_note + ('; Engine Fixes 7.0.14+ was not found' if ef_fix is False else
                                               '; could not check for Engine Fixes, so keep it a full plugin'))
                 out.append(c)
                 continue
@@ -316,8 +317,10 @@ def analyse(model, configs=False, deep_configs=False):
         lo_bound = 0x001 if hedr171 else 0x800
         max_new = 0xFFF - lo_bound + 1
         has_sky = 'skyrim.esm' in [m.lower() for m in s.masters]
-        ok_deps = all(d.scan is not None and d.scan.hedr_version >= 1.705 and
-                      'skyrim.esm' in [m.lower() for m in d.scan.masters] for d in deps)
+        # IDs 001-7FF would read as hardcoded engine forms in any file where this
+        # plugin is master index 00 (a dependent that lists it first)
+        ok_deps = all(d.scan is not None and d.scan.hedr_version >= 1.705 and d.scan.masters
+                      and d.scan.masters[0].lower() != e.low for d in deps)
         can_171 = supports_171 is not False and has_sky and ok_deps     # may use 001-7FF after header 1.71
         cap = 0xFFF if (hedr171 or can_171) else 0x800
         if c.n_new > cap:
@@ -340,7 +343,8 @@ def analyse(model, configs=False, deep_configs=False):
             flag_risks.append('has a SEQ file: its start-game dialogue may not work until you save and reload')
         pex = _scripts_mention(dirs, e.name) if (s.has_scripts or new_sigs.get('QUST')) else []
         if any(m for _p, _g, m in pex):
-            flag_risks.append('a script checks for it with GetModByName, which does not find light plugins')
+            flag_risks.append('a script calls GetModByName on it: for light plugins it returns 0x100 or more, so '
+                              'scripts that compare the result with 255 or build FormIDs from it break')
         if in_range and c.n_new <= max_new:
             c.verdict = 'flag'
             c.reasons.append(f'all {c.n_new} new record(s) use object IDs {lo_bound:03X}-FFF: set the ESL flag, '
@@ -411,10 +415,10 @@ def analyse(model, configs=False, deep_configs=False):
         dll = dlls.mentions(e.name)
         if dll:
             hard.append(f'SKSE plugin(s) {", ".join(dll[:3])} contain its name and may hard-code its FormIDs '
-                        '(cannot be patched)')
+                        '(ESLifier does not patch DLLs; compacting would need an updated DLL)')
         if new_sigs.get('WTHR'):
             c.risks.append(f'{new_sigs["WTHR"]} new weather(s): ENB weather files refer to their FormIDs '
-                           '(cannot be patched)')
+                           '(no tool patches them; fix the ENB weather list by hand)')
         if hard:
             c.verdict = 'no'
             c.reasons += hard
@@ -430,10 +434,13 @@ def procedure(game_supports_171=None):
         'Back up the profile, the plugins and your saves; best done before starting a playthrough '
         '(flagging plugins used by an ongoing save is disputed; compacting needs a new game).',
         'Flag-only first (no FormIDs change): esp esl <plugin> --flag, Vortex "Mark light", or ESLifier\'s '
-        'left list. Keep the .esp extension so the load-order position stays the same.',
+        'left list. Keep the .esp extension so the load-order position stays the same. Note: ESLifier also '
+        'writes header 1.71 when flagging (its 1.71 option is on by default).',
         'Compact only when you need more slots, and only with ESLifier (it renames FaceGen/voice files and patches '
         'scripts, SEQ files, ~100 SKSE config formats and dependent plugins). Install its output as a mod that '
-        'wins conflicts, and run its "Scan and Rebuild" after any mod change.',
+        'wins conflicts, and run its "Scan and Rebuild" after any mod change. (xEdit\'s "Compact FormIDs for '
+        'ESL" only renumbers the plugin and plugins loaded with it, and is hidden once a plugin is light: '
+        'compact first, then flag.)',
         'Re-sort (LOOT) and re-generate Bashed/Smashed/Synthesis/DynDOLOD output afterwards; test faces, '
         'dialogue and cells in game.',
     ]
