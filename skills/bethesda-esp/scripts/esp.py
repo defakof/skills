@@ -1035,10 +1035,29 @@ def _print_issues(issues, limit=200, include_info=True):
 
 
 def _load_rules(path):
+    """--rules JSON: {"Plugin.esp": {"after": [...], "before": [...]}}."""
     if not path:
         return {}
-    with open(path, encoding='utf-8') as f:
-        return json.load(f)
+    try:
+        with open(path, encoding='utf-8-sig') as f:
+            data = json.load(f)
+    except (OSError, ValueError) as ex:
+        raise EspError(f'cannot read rules file {path}: {ex}')
+    if not isinstance(data, dict):
+        raise EspError(f'{path}: expected {{"Plugin.esp": {{"after": [...], "before": [...]}}}}')
+    out = {}
+    for name, r in data.items():
+        if not isinstance(r, dict):
+            raise EspError(f'{path}: the value for {name!r} must be an object with "after"/"before" lists')
+        rule = {}
+        for k in ('after', 'before', 'req'):
+            v = r.get(k, [])
+            v = [v] if isinstance(v, str) else v
+            if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+                raise EspError(f'{path}: {name}.{k} must be a list of plugin names')
+            rule[k] = v
+        out[name] = rule
+    return out
 
 
 def _written_order(model, order):
@@ -1176,17 +1195,17 @@ def cmd_loadorder(args):
         if model.manager == 'MO2' and not args.write_loadorder:
             say('  MO2 takes the order from the profile\'s loadorder.txt when it starts: also write it with '
                 '--write-loadorder, or the old order comes back')
+    if bad_names:
+        say(f'  warning: {len(bad_names)} name(s) are not Windows-1252 and were written with "?" (the game '
+            'cannot load them anyway; rename those plugins): ' + ', '.join(bad_names[:5]))
     if args.write_loadorder:
         say(f'wrote {args.write_loadorder} (loadorder.txt: every plugin, in the same order)')
-        if bad_names:
-            say(f'  warning: {len(bad_names)} name(s) are not Windows-1252 and were written with "?": '
-                + ', '.join(bad_names[:5]))
 
 
 def cmd_loot_update(args):
     try:
         out, data = masterlist_mod.update_snapshot(args.source)
-    except RuntimeError as ex:
+    except (RuntimeError, ValueError) as ex:
         raise EspError(str(ex))
     except OSError as ex:
         raise EspError(f'could not get the masterlist: {ex} (download it in a browser from '

@@ -138,6 +138,8 @@ def parse_subrecords(data):
         sig, size = SUB_HDR.unpack_from(data, pos)
         pos += 6
         if sig == b'XXXX':
+            if pos + 4 > end:
+                raise EspError(f'truncated XXXX size at offset {pos}')
             pending_size = struct.unpack_from('<I', data, pos)[0]
             pos += size
             continue

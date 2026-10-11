@@ -305,7 +305,9 @@ plugins:
         dirty = by['dirty'][0]
         self.assertEqual(dirty.plugin, 'Dirty.esp')
         self.assertIn('2 ITM', dirty.message)
-        self.assertNotIn('MissingMaster.esp', [i.plugin for i in by.get('missing-master', [])])   # Filter patch
+        # a Filter patch still needs its masters while active (SE cannot merge it into the Bashed Patch)
+        self.assertIn('MissingMaster.esp', [i.plugin for i in by.get('missing-master', [])])
+        self.assertIn('MissingMaster.esp', [i.plugin for i in by.get('filter-patch', [])])
         self.assertEqual([i.plugin for i in by['undefined-group']], ['Injector1.esp'])
         order, moves, notes = m.sort()
         names = [e.name for e in order]
@@ -706,7 +708,8 @@ class TestReviewFixes(LoBase):
         with open(os.path.join(m.data, 'BashTags', 'FilterPatch.txt'), 'w') as f:
             f.write('Filter\n')
         codes = self.codes(m.model(masterlist='none'))
-        self.assertNotIn(('missing-master', 'FilterPatch.esp'), codes)
+        self.assertIn(('filter-patch', 'FilterPatch.esp'), codes)       # tag read without LOOT data
+        self.assertIn(('missing-master', 'FilterPatch.esp'), codes)
 
     def test_hedr_low_range_dependent(self):
         m = self.mini('lowrange')
@@ -850,3 +853,142 @@ class TestReviewFixesScan(LoBase):
         self.assertIn('-t LVLI', cmd)
         how, _tools = advice._how('quests', many[:1], ['A.esp', 'B.esp'], False)
         self.assertTrue(any('--create' in h for h in how))
+
+
+def fake_dll(path, version):
+    """A minimal 'executable' with a VS_FIXEDFILEINFO block (for version checks)."""
+    import struct
+    a, b, c, d = version
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'wb') as f:
+        f.write(b'MZ' + b'\0' * 62 + b'\xbd\x04\xef\xfe' +
+                struct.pack('<5I', 0x10000, (a << 16) | b, (c << 16) | d, (a << 16) | b, (c << 16) | d))
+
+
+class TestReviewRound2(LoBase):
+    def mini(self, name):
+        return Mini(os.path.join(self.tmp, 'r2_' + name))
+
+    def test_bad_paths_and_not_a_profile(self):
+        from esplib import EspError
+        with self.assertRaises(EspError):
+            lorder.LoadOrderModel.from_sources(data=os.path.join(self.tmp, 'nope'), plugins_txt=self.ptxt)
+        with self.assertRaises(EspError):
+            lorder.LoadOrderModel.from_sources(data=self.data, plugins_txt=os.path.join(self.tmp, 'nope.txt'))
+        inst = os.path.join(self.tmp, 'r2_inst')
+        os.makedirs(os.path.join(inst, 'profiles', 'Default'))
+        with self.assertRaises(EspError) as cm:
+            lorder.LoadOrderModel.from_sources(mo2_profile=inst, data=self.data)
+        self.assertIn('Default', str(cm.exception))                 # lists the profiles it found
+
+    def test_qt_ini_values(self):
+        q = lorder._qt_ini_value
+        self.assertEqual(q('@ByteArray(C:\\\\Games\\\\Skyrim)'), 'C:\\Games\\Skyrim')
+        self.assertEqual(q('@ByteArray(D:\\\\Jeux\\\\\\xc3\\xa9t\\xc3\\xa9)'), 'D:\\Jeux\\\u00e9t\u00e9')
+        self.assertEqual(q('"C:\\\\a, b"'), 'C:\\a, b')
+        self.assertEqual(q('mods'), 'mods')
+
+    def test_damaged_plugin_and_bsa_do_not_crash(self):
+        import struct
+        m = self.mini('damaged')
+        good = m.new('Good.esp', ['Skyrim.esm'])
+        good.set_hedr(next_object_id=0x5000)              # forces the compaction checks (which open BSAs)
+        m.rec('Good.esp', 'NPC_', 'GoodNpc', [('FULL', 'Npc')])
+        m.new('Bad.esp', ['Skyrim.esm'])
+        m.rec('Bad.esp', 'KYWD', 'BadKw1')
+        m.rec('Bad.esp', 'KYWD', 'BadKw2')
+        m.save()
+        bad = os.path.join(m.data, 'Bad.esp')
+        with open(bad, 'rb') as f:
+            data = f.read()
+        g = data.index(b'GRUP')                             # cut the file right after the first record
+        rec1 = struct.unpack_from('<I', data, g + 24 + 4)[0]
+        with open(bad, 'wb') as f:
+            f.write(data[:g + 24 + 24 + rec1])
+        with open(os.path.join(m.data, 'Good.bsa'), 'wb') as f:
+            f.write(b'BSA\0' + struct.pack('<IIIIIIIHH', 105, 36, 3, 1, 1, 0, 0, 0, 0) + b'\x05')  # index cut off
+        model = m.model()
+        self.assertIn(('unreadable', 'Bad.esp'), [(i.code, i.plugin) for i in model.validate()])
+        res = {c.entry.name: c for c in eslify.analyse(model, configs=True)}      # must not raise
+        self.assertEqual(res['Good.esp'].verdict, 'compact-care')
+        from esplib.strings import BSA
+        from esplib import EspError
+        with self.assertRaises(EspError):
+            BSA(os.path.join(m.data, 'Good.bsa'))
+
+    def test_plugin_name_index(self):
+        names = eslify._plugin_names_in(
+            b'keyword = kw|npc|0x5001~needscompact.esp\n"plugin": "my mod.esp", a.esp,b.esp '
+            b'\x00\x41long plugin name for testing purposes.esp\x00'
+            + 'wide.esp'.encode('utf-16-le'), stray_prefix=True)
+        for n in (b'needscompact.esp', b'my mod.esp', b'a.esp', b'b.esp',
+                  b'long plugin name for testing purposes.esp', b'wide.esp'):
+            self.assertIn(n, names)
+
+    def test_rules_file_validation(self):
+        import esp
+        from esplib import EspError
+        p = os.path.join(self.tmp, 'rules.json')
+        with open(p, 'w', encoding='utf-8-sig') as f:
+            f.write('{"A.esp": {"after": "B.esp"}}')
+        self.assertEqual(esp._load_rules(p), {'A.esp': {'after': ['B.esp'], 'before': [], 'req': []}})
+        with open(p, 'w') as f:
+            f.write('["A.esp"]')
+        with self.assertRaises(EspError):
+            esp._load_rules(p)
+
+    def test_unknown_warning_codes_still_advised(self):
+        iss = [lorder.Issue('warning', 'some-new-code', 'X.esp', 'something new'),
+               lorder.Issue('info', 'some-note', 'X.esp', 'just a note')]
+        adv = advice.from_validation(iss)
+        self.assertEqual([a.title for a in adv], ['something new'])
+        self.assertEqual(adv[0].priority, 3)
+
+    def test_generated_by_name_not_group(self):
+        m = self.mini('gengroup')
+        m.new('MyLateFixes.esp', ['Skyrim.esm'])
+        m.new('Synthesis_2.esp', ['Skyrim.esm'])
+        m.save()
+        ul = self.userlist("plugins:\n  - name: 'MyLateFixes.esp'\n    group: 'Late Fixes & Changes'\n")
+        model = m.model(userlist=ul)
+        names = model.by_name()
+        self.assertFalse(model.is_generated(names['mylatefixes.esp']))
+        self.assertTrue(model.is_generated(names['synthesis_2.esp']))
+        self.assertEqual(model.group_of(names['mylatefixes.esp']), 'Late Fixes & Changes')
+
+    def test_engine_fixes_cell_check(self):
+        m = self.mini('ef')
+        p = m.new('CellMod.esp', ['Skyrim.esm'])
+        m.rec('CellMod.esp', 'CELL', 'NewCell', [('DATA', {'flags': ['Interior']})])
+        light = m.new('LightCell.esp', ['Skyrim.esm'], esl=True)
+        m.rec('LightCell.esp', 'CELL', 'LightNewCell', [('DATA', {'flags': ['Interior']})])
+        m.save()
+        res = {c.entry.name: c for c in eslify.analyse(m.model())}
+        self.assertEqual(res['CellMod.esp'].verdict, 'no')             # no Engine Fixes
+        lvl = {i.code: i.level for i in m.model().validate() if i.plugin == 'LightCell.esp'}
+        self.assertEqual(lvl['esl-new-cell'], 'warning')
+        fake_dll(os.path.join(m.data, 'SKSE', 'Plugins', 'EngineFixes.dll'), (7, 0, 14, 0))
+        res = {c.entry.name: c for c in eslify.analyse(m.model())}
+        self.assertEqual(res['CellMod.esp'].verdict, 'flag')
+        lvl = {i.code: i.level for i in m.model().validate() if i.plugin == 'LightCell.esp'}
+        self.assertEqual(lvl['esl-new-cell'], 'info')
+        fake_dll(os.path.join(m.data, 'SKSE', 'Plugins', 'EngineFixes.dll'), (7, 0, 13, 0))
+        res = {c.entry.name: c for c in eslify.analyse(m.model())}
+        self.assertEqual(res['CellMod.esp'].verdict, 'no')             # 7.0.13 is not enough
+        self.assertTrue(p and light)
+
+    def test_explain_moves_scales(self):
+        n = 1500
+        nodes = [f'p{i}' for i in range(n)]
+        topo = lorder.DynTopo(nodes)
+        for i in range(n - 1):                          # the new order is the reverse of the old one,
+            for j in range(i + 1, min(n, i + 100)):     # with ~150k edges: almost every plugin moves
+                topo.add(nodes[j], nodes[i], f'{j} before {i}')
+        before = [lorder.Entry(x) for x in nodes]
+        by = {e.low: e for e in before}
+        after = [by[x] for x in topo.stable_order({x: i for i, x in enumerate(nodes)})]
+        t = time.time()
+        moves = lorder._explain_moves(before, after, topo)
+        self.assertLess(time.time() - t, 10)
+        self.assertEqual(len(moves), n - 1)
+        self.assertTrue(all(r for _e, r in moves))

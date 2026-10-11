@@ -9,6 +9,7 @@ Only plugins (.esp/.esm/.esl) are considered here; BSA archives are not.
 
 import os
 import re
+import struct
 
 from .core import EspError
 from .scan import scan_file
@@ -61,6 +62,9 @@ LATE_LOADERS = [
     (r'^dyndolod.*\.es[mp]$', 'DynDOLOD output'),
     (r'^occlusion\.esp$', 'DynDOLOD/xLODGen occlusion'),
     (r'^npc appearances merged\.esp$', 'EasyNPC output'),
+    (r'^automated leveled list addition\.esp$', 'ALLA output'),
+    (r'^one imch patch.*\.esp$', 'One ImCh patcher output'),
+    (r'^requiem for the indifferent\.esp$', 'Reqtificator output'),
 ]
 GENERATED_GROUPS = ('Dynamic Patches', 'Late Fixes & Changes', 'Dynamic LOD')
 # Build/load order of generated patches: Bashed/Smashed, then Synthesis, then LOD.
@@ -190,6 +194,37 @@ def default_plugins_txt_candidates(game_dir=None):
     return out
 
 
+def _qt_ini_value(v):
+    """Undo QSettings INI escaping (\\, \\", \\xNN, surrounding quotes, @ByteArray())."""
+    v = v.strip()
+    if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+        v = v[1:-1]
+    is_bytes = v.startswith('@ByteArray(') and v.endswith(')')
+    if is_bytes:
+        v = v[len('@ByteArray('):-1]
+    out = bytearray()
+    i = 0
+    simple = {'\\': b'\\', '"': b'"', 'n': b'\n', 't': b'\t', 'r': b'\r', '0': b'\0', 'a': b'\a'}
+    while i < len(v):
+        ch = v[i]
+        if ch == '\\' and i + 1 < len(v):
+            nxt = v[i + 1]
+            if nxt == 'x':
+                m = re.match(r'[0-9a-fA-F]{1,%d}' % (2 if is_bytes else 4), v[i + 2:])
+                if m:
+                    code = int(m.group(0), 16)
+                    out += bytes([code]) if is_bytes else chr(code).encode('utf-8')
+                    i += 2 + len(m.group(0))
+                    continue
+            if nxt in simple:
+                out += simple[nxt]
+                i += 2
+                continue
+        out += ch.encode('utf-8')
+        i += 1
+    return out.decode('utf-8', errors='replace')
+
+
 def _mo2_ini_paths(profile_dir):
     """(game Data dir, mods dir, overwrite dir) from ModOrganizer.ini, if found."""
     inst = os.path.abspath(os.path.join(profile_dir, '..', '..'))
@@ -202,11 +237,7 @@ def _mo2_ini_paths(profile_dir):
                 continue
             k, v = line.split('=', 1)
             k = k.strip().lower()
-            v = v.strip()
-            m = re.match(r'@ByteArray\((.*)\)', v)
-            if m:
-                v = m.group(1)
-            v = v.replace('\\\\', '\\')
+            v = _qt_ini_value(v)
             if k == 'gamepath':
                 game = os.path.join(v, 'Data')
             elif k in ('settings\\base_directory', 'base_directory'):
@@ -300,8 +331,20 @@ class LoadOrderModel:
                      auto=True, masterlist=None, userlist=None, use_metadata=True):
         lo = cls()
         listed = []          # [(name, active)]
+        for what, path, isdir in (('Data folder', data, True), ('plugins.txt', plugins_txt, False),
+                                  ('loadorder.txt', loadorder_txt, False), ('MO2 profile folder', mo2_profile, True),
+                                  ('MO2 mods folder', mods_dir, True), ('Skyrim.ccc', ccc, False)):
+            if path and not (os.path.isdir(path) if isdir else os.path.isfile(path)):
+                raise EspError(f'{what} not found: {path}')
         if mo2_profile:
             prof = os.path.abspath(mo2_profile)
+            if not os.path.isfile(os.path.join(prof, 'plugins.txt')) and not plugins_txt:
+                profs = os.path.join(prof, 'profiles')
+                hint = ''
+                if os.path.isdir(profs):
+                    hint = ' - profiles there: ' + ', '.join(sorted(os.listdir(profs))[:10])
+                raise EspError(f'{prof} is not an MO2 profile folder (expected <MO2>/profiles/<name> with a '
+                               f'plugins.txt){hint}')
             game, mods, overwrite = _mo2_ini_paths(prof)
             data = data or game
             mods_dir = mods_dir or mods
@@ -456,21 +499,40 @@ class LoadOrderModel:
                                      'Re-sort or save the order in the mod manager so both files match; when '
                                      'editing an MO2 profile by hand, write both files in the same order.'))
 
-    def find_path(self, name):
-        low = name.lower()
+    def _plugin_index(self):
+        """{lower file name: (path, label)} of plugin files (and .ghost files) in
+        the search folders, highest priority first; each folder is listed once."""
+        idx = self.__dict__.get('_pidx')
+        if idx is not None and self.__dict__.get('_pidx_dirs') == len(self.search_dirs):
+            return idx
+        idx = {}
         for d, label in self.search_dirs:
-            for cand in (name, name + '.ghost'):
-                p = os.path.join(d, cand)
-                if os.path.isfile(p):
-                    return p, label
             try:
-                for n in os.listdir(d):
-                    nl = n.lower()
-                    if nl == low or nl == low + '.ghost':
-                        return os.path.join(d, n), label
+                names = os.listdir(d)
             except OSError:
-                pass
-        return None, None
+                continue
+            for n in names:
+                nl = n.lower()
+                if nl in idx or not is_plugin_name(nl):
+                    continue
+                p = os.path.join(d, n)
+                if os.path.isfile(p):
+                    idx[nl] = (p, label)
+        self._pidx = idx
+        self._pidx_dirs = len(self.search_dirs)
+        return idx
+
+    def find_path(self, name):
+        """(path, label) of the winning copy of a plugin, or of its .ghost file when
+        that comes from a higher-priority folder."""
+        idx = self._plugin_index()
+        low = name.lower()
+        hit, ghost = idx.get(low), idx.get(low + '.ghost')
+        if hit and ghost:
+            rank = {d: i for i, (d, _l) in enumerate(self.search_dirs)}
+            if rank.get(os.path.dirname(ghost[0]), 0) < rank.get(os.path.dirname(hit[0]), 0):
+                return ghost
+        return hit or ghost or (None, None)
 
     def _resolve(self, name, explicit=None):
         """(path, label, ghost path) for a plugin name; a plugin that only exists
@@ -524,16 +586,10 @@ class LoadOrderModel:
     def _find_unlisted(self):
         known = {e.low for e in self.entries}
         found = {}
-        for d, label in self.search_dirs:
-            try:
-                names = os.listdir(d)
-            except OSError:
+        for nl, (path, label) in self._plugin_index().items():
+            if nl.endswith('.ghost') or nl in known:
                 continue
-            for n in names:
-                if not is_plugin_name(n) or n.lower().endswith('.ghost'):
-                    continue
-                if n.lower() not in known and n.lower() not in found and os.path.isfile(os.path.join(d, n)):
-                    found[n.lower()] = (n, label, os.path.join(d, n))
+            found[nl] = (os.path.basename(path), label, path)
         self.unlisted = sorted(((n, label) for n, label, _p in found.values()), key=lambda t: t[0].lower())
         for n, label, path in sorted(found.values(), key=lambda t: t[0].lower()):
             self.entries.append(Entry(n, path, False, None, None, label))   # installed, inactive
@@ -543,8 +599,8 @@ class LoadOrderModel:
             if e.path and (e.active or e.implicit):
                 try:
                     e.scan = scan_file(e.path, use_cache)
-                except (EspError, OSError) as ex:
-                    e.scan_error = str(ex)
+                except (EspError, OSError, struct.error, IndexError, ValueError) as ex:
+                    e.scan_error = str(ex) or type(ex).__name__
 
     # -- views ---------------------------------------------------------------
     def by_name(self):
@@ -666,9 +722,12 @@ class LoadOrderModel:
         return g
 
     def is_generated(self, e):
-        if late_loader_reason(e.name):
-            return True
-        return bool(self.meta and self.group_of(e) in GENERATED_GROUPS)
+        """Built by a tool from the current load order (decided by file name; LOOT
+        groups only say a plugin loads late, not that a tool made it)."""
+        cache = self.__dict__.setdefault('_gen_cache', {})
+        if e.low not in cache:
+            cache[e.low] = bool(late_loader_reason(e.name))
+        return cache[e.low]
 
     def tags_of(self, e):
         """Bash Tags (plugin description, LOOT metadata, Data/BashTags/<plugin>.txt)."""
@@ -732,6 +791,7 @@ class LoadOrderModel:
                                 'Enable or disable it in the mod manager so it gets a position.'))
         n_full = n_light = 0
         hedr171 = []
+        ef_fix = None                  # SSE Engine Fixes 7.0.14+ (ESL cell bug fix), checked on demand
         for e in order:
             s = e.scan
             if s is None:
@@ -742,7 +802,17 @@ class LoadOrderModel:
                 n_full += 1
             pmeta = self.meta.for_plugin(e.name) if self.meta else None
             tags = self.tags_of(e)
-            filter_patch = 'Filter' in tags or re.search(r'\{\{\s*BASH\s*:[^}]*\bFilter\b', s.description or '', re.I)
+            # Wrye Bash "Filter" patches are meant to be merged into the Bashed Patch and
+            # deactivated; SE's Bashed Patch cannot merge plugins, so an active one with
+            # a missing master still crashes the game
+            filter_patch = False
+            if 'Filter' in tags and any(names.get(m.lower()) is None or not names[m.lower()].path
+                                        or not (names[m.lower()].active or names[m.lower()].implicit)
+                                        for m in s.masters):
+                issues.append(Issue('info', 'filter-patch', e.name,
+                                    f'{e.name} is a Bash "Filter" patch: built to be merged into a Bashed Patch, '
+                                    'which Skyrim SE\'s Wrye Bash cannot do; while active it needs all its masters',
+                                    f'Deactivate {e.name}, or install and activate its masters.'))
             # masters
             if any(m.lower() == e.low for m in s.masters):
                 issues.append(Issue('error', 'self-master', e.name, f'{e.name} lists itself as a master',
@@ -787,7 +857,7 @@ class LoadOrderModel:
                                     f'{e.name} has header version {s.hedr_version:.2f}: a Skyrim LE (Oldrim) plugin '
                                     'that was not converted for Special Edition',
                                     'Get the SE version of the mod, or open and save it once in the SE Creation Kit '
-                                    '(with SSE CreationKit Fixes).'))
+                                    '(current Steam CK with Creation Kit Platform Extended; SSE CreationKit Fixes is only for CK 1.5.73).'))
             elif s.old_form_records and len(s.formids) and not e.implicit:
                 frac = s.old_form_records / len(s.formids)
                 if frac >= 0.5:
@@ -795,7 +865,7 @@ class LoadOrderModel:
                                         f'{e.name}: {s.old_form_records} of {len(s.formids)} records have form '
                                         'version 43 (Skyrim LE format). Usually harmless; weapon critical-hit '
                                         'data (WEAP CRDT) is read wrongly',
-                                        'Re-save it in the SE Creation Kit (with SSE CreationKit Fixes) if it adds '
+                                        'Re-save it in the SE Creation Kit (with Creation Kit Platform Extended) if it adds '
                                         'or edits weapons.'))
             if s.hedr_version >= 1.705 and not e.implicit:
                 hedr171.append(e.name)
@@ -830,8 +900,11 @@ class LoadOrderModel:
                                         'Remove the ESL flag, or compact its FormIDs first (xEdit "Compact FormIDs '
                                         'for ESL", or ESLifier) - this breaks plugins/saves that use it.'))
                 new_cells = sum(1 for fid, sig, _ in s.records() if sig == 'CELL' and (fid >> 24) == s.self_index)
+                if new_cells and ef_fix is None:
+                    from .eslify import _engine_fixes_cell_fix
+                    ef_fix = _engine_fixes_cell_fix(self)
                 if new_cells:
-                    issues.append(Issue('warning', 'esl-new-cell', e.name,
+                    issues.append(Issue('info' if ef_fix else 'warning', 'esl-new-cell', e.name,
                                         f'{e.name} is a light plugin that adds {new_cells} new CELL record(s); '
                                         'such cells lose temporary references when other plugins override them '
                                         'and interior cells reload wrongly, unless SSE Engine Fixes 7.0.14+ '
@@ -1275,16 +1348,19 @@ def _explain_moves(before, after, topo):
     b = [e.low for e in after]
     keep = _lcs_keep(a, b)
     pos_before = {x: i for i, x in enumerate(a)}
+    moved = {x for x in b if x not in keep}
+    by_node = {}                    # edges that had to reverse the old order, per moved plugin
+    for (u, v), why in topo.reasons.items():
+        if pos_before[u] > pos_before[v] and (u in moved or v in moved):
+            by_node.setdefault(u, []).append((v, why))
+            by_node.setdefault(v, []).append((u, why))
     moves = []
-    moved = {e.low for e in after if e.low not in keep}
-    for e in after:
-        if e.low in keep:
+    for e, low in zip(after, b):
+        if low in keep:
             continue
         primary, secondary = [], []
-        for (u, v), why in topo.reasons.items():
-            if e.low in (u, v) and pos_before[u] > pos_before[v]:
-                other = v if u == e.low else u
-                (secondary if other in moved else primary).append(why)
+        for other, why in by_node.get(low, ()):
+            (secondary if other in moved else primary).append(why)
         reasons = list(dict.fromkeys(primary or secondary))
         moves.append((e, reasons or ['follows a plugin that had to move']))
     return moves

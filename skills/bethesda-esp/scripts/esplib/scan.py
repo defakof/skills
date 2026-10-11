@@ -17,7 +17,7 @@ from array import array
 from .core import EspError, parse_subrecords, _find_sub, FLAG_COMPRESSED, FLAG_DELETED
 from .loadorder import cache_dir
 
-SCAN_VERSION = 4
+SCAN_VERSION = 5
 
 _REC = struct.Struct('<4sIII')       # sig, size, flags, formid
 _GRP = struct.Struct('<4sI4si')      # 'GRUP', size, label, type
@@ -160,6 +160,8 @@ def scan_bytes(buf, name, path=''):
     if len(buf) < 24 or buf[:4] != b'TES4':
         raise EspError(f'{name}: not a TES4-format plugin')
     _, hsize, hflags, _ = _REC.unpack_from(buf, 0)
+    if 24 + hsize > len(buf):
+        raise EspError(f'{name}: truncated file (the plugin header is cut off)')
     s.flags = hflags
     s.form_version = _VER.unpack_from(buf, 20)[0]
     for sub in parse_subrecords(buf[24:24 + hsize]):
@@ -190,6 +192,8 @@ def scan_bytes(buf, name, path=''):
             _, gsize, label, gtype = grp_unpack(buf, pos)
             if gsize < 24:
                 raise EspError(f'{name}: bad group size at offset {pos}')
+            if pos + gsize > end:
+                raise EspError(f'{name}: truncated file (a record group at offset {pos} runs past the end)')
             stack.append((gtype, struct.unpack('<I', label)[0], pos + gsize))
             pos += 24
             continue
@@ -249,7 +253,7 @@ def scan_file(path, use_cache=True):
         buf = f.read()
     s = scan_bytes(buf, name, path)
     s.mtime = st.st_mtime
-    if use_cache and st.st_size > 64 * 1024:
+    if use_cache and st.st_size > 8 * 1024:
         try:
             os.makedirs(os.path.dirname(cpath), exist_ok=True)
             tmp = cpath + '.tmp'

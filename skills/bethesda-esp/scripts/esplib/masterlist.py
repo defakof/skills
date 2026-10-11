@@ -531,6 +531,7 @@ class Evaluator:
         self.model = model
         self._cache = {}
         self._dirlist = {}
+        self._first = {}
         self._crc = {}
         names = model.by_name()
         self.installed = {k: e for k, e in names.items() if e.path}
@@ -647,6 +648,13 @@ class Evaluator:
         roots, parts = self._roots(path)
         if roots is None:
             return None
+        if parts:
+            # only folders that have the first path component (each folder is listed once)
+            first = parts[0].lower()
+            key = (id(roots), first)
+            if key not in self._first:
+                self._first[key] = [r for r in roots if first in self._listdir(r)]
+            roots = self._first[key]
         for r in roots:
             hit = self._resolve_in(r, parts)
             if hit and not hit.lower().endswith('.mohidden'):
@@ -1027,13 +1035,21 @@ def update_snapshot(src=None):
         with open(src, encoding='utf-8-sig') as f:
             text = f.read()
         source = src
+    elif src and '://' not in src:
+        raise RuntimeError(f'file not found: {src}')
     else:
         import urllib.request
         url = src or MASTERLIST_URL
         with urllib.request.urlopen(url, timeout=60) as r:
             text = r.read().decode('utf-8')
         source = url
-    data = compact_metadata(parse_yaml_text(text), source=source)
+    try:
+        doc = parse_yaml_text(text)
+    except Exception as ex:  # noqa: BLE001 - yaml.YAMLError etc.
+        raise RuntimeError(f'{source} is not valid YAML: {ex}')
+    if not isinstance(doc, dict) or not isinstance(doc.get('plugins'), list):
+        raise RuntimeError(f'{source} does not look like a LOOT masterlist (no "plugins" list)')
+    data = compact_metadata(doc, source=source)
     os.makedirs(_cache_root(), exist_ok=True)
     out = updated_snapshot_path()
     write_compact(data, out)

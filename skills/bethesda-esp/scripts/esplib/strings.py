@@ -149,6 +149,12 @@ def _candidate_bsas(data_dir, base):
 class BSA:
     def __init__(self, path):
         self.path = path
+        try:
+            self._read_index(path)
+        except (struct.error, IndexError, UnicodeDecodeError) as ex:
+            raise EspError(f'{path}: damaged or truncated BSA ({ex})')
+
+    def _read_index(self, path):
         with open(path, 'rb') as f:
             head = f.read(36)
             if len(head) < 36 or head[:4] != b'BSA\0':

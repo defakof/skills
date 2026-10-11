@@ -196,7 +196,7 @@ suggested moves with reasons. Codes (level):
 
 | code | level | meaning |
 |---|---|---|
-| `missing-master`, `inactive-master` | error | game crashes on start (skipped for Bash `Filter` patches); a ghosted master counts as missing |
+| `missing-master`, `inactive-master` | error | game crashes on start; a ghosted master counts as missing (Bash `Filter` patches also get a `filter-patch` note: deactivate them) |
 | `master-cycle` | error | plugins list each other as masters |
 | `master-order` | error | plugin loads before its master |
 | `master-needs-nonmaster` | error | master-flagged plugin depends on a regular plugin (game hoists it; LOOT cannot sort) |

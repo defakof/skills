@@ -100,7 +100,16 @@ VALIDATION_ADVICE = {
     'lo-desync': (3, 'Mod managers can overwrite one file from the other.', []),
     'le-header': (3, 'Unconverted Skyrim LE plugins can misbehave in SE.', ['ck']),
     'le-records': (4, 'Form 43 records are mostly fine; weapon critical data is read wrongly.', ['ck']),
-    'esl-new-cell': (3, 'New cells in light plugins are known to lose changes.', []),
+    'esl-new-cell': (3, 'Without SSE Engine Fixes 7.0.14+ (bESLCELLLoadBug), new cells in light plugins lose '
+                        'temporary references and reload wrongly.', []),
+    'ghosted': (2, 'A ghosted plugin is invisible to the game, so plugins that need it fail.', []),
+    'hedr-low-range': (2, 'References into a header-1.71 master\'s 001-7FF range only work from 1.71 plugins.',
+                       ['xedit']),
+    'loot-cannot-sort': (3, 'LOOT stops with a cyclic-interaction error, so the mod manager\'s sort fails.',
+                         ['loot']),
+    'loot-metadata': (3, 'Some LOOT rules could not be read, so their checks and sort rules are missing.', []),
+    'esl-id-zero': (3, 'Object ID 000 is not used by current tools; some may treat it as the file header.',
+                    ['eslifier', 'xedit']),
     'near-plugin-limit': (3, 'Close to the full-plugin limit.', ['esp-eslify', 'eslifier']),
     'not-found': (3, '', []),
     'duplicate-entry': (3, '', []),
@@ -120,9 +129,9 @@ def from_validation(issues):
             continue
         spec = VALIDATION_ADVICE.get(i.code)
         if spec is None:
-            if i.level != 'error':
+            if i.level == 'info':
                 continue
-            spec = (1, '', [])
+            spec = (1 if i.level == 'error' else 3, '', [])     # codes added later still show up
         prio, why, tools = spec
         if i.code == 'dirty' and i.level == 'warning':
             prio = 2

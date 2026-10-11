@@ -233,6 +233,12 @@ class Scanner:
     def is_patch(self, e):
         """A compatibility patch: needs two or more non-official mods as masters
         (or one, if it calls itself a patch)."""
+        cache = self.__dict__.setdefault('_patch_cache', {})
+        if e.low not in cache:
+            cache[e.low] = self._is_patch(e)
+        return cache[e.low]
+
+    def _is_patch(self, e):
         s = e.scan
         if s is None or e.implicit or self.model.is_generated(e):
             return False

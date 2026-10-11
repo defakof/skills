@@ -10,6 +10,8 @@ a tool like ESLifier patches all of them.
 """
 
 import os
+import re
+import struct
 
 from . import masterlist as mlist
 
@@ -70,75 +72,136 @@ def _exists_ci(base, *parts):
     return cur
 
 
-def _config_mentions(dirs, plugin_name, deep=False, limit=50):
-    """Text config files (SKSE plugin INIs, JSON...) that mention the plugin."""
-    needle = plugin_name.lower().encode('utf-8')
-    hits = []
-    for base in dirs:
-        roots = [base]
-        if not deep:
-            # quick: Data root files + SKSE folder only
-            roots = []
-            try:
-                for n in os.listdir(base):
-                    p = os.path.join(base, n)
-                    if os.path.isfile(p) and n.lower().endswith(CONFIG_EXTS):
-                        _check_file(p, needle, hits)
-            except OSError:
-                pass
-            skse = _exists_ci(base, 'SKSE')
-            if skse:
-                roots.append(skse)
-        for root in roots:
-            for dp, _dn, fn in os.walk(root):
-                for n in fn:
-                    if n.lower().endswith(CONFIG_EXTS):
-                        _check_file(os.path.join(dp, n), needle, hits)
-                        if len(hits) >= limit:
-                            return hits
-    return hits
+_NAME_END = re.compile(rb'\.es[mpl](?![a-z0-9_])')
+_WIDE_NAME = re.compile(rb'((?:[\x20-\xff]\x00){1,250}?)\.\x00e\x00s\x00[mpl]\x00')
+_NOT_IN_NAME = set(b'\x00"~|=:<>*?/\\\t\r\n')
 
 
-def _check_file(path, needle, hits):
-    try:
-        if os.path.getsize(path) > MAX_CONFIG_SIZE:
+def _plugin_names_in(data, stray_prefix=False):
+    """Lower-case plugin file names (bytes) mentioned in lower-cased data. Each
+    candidate is also indexed from every separator on, so "a.esp,b.esp" and
+    "Keyword = 0x800~My Mod.esp" both yield the plain names."""
+    out = set()
+
+    def add(raw):
+        raw = raw.strip()
+        if not raw:
             return
-        with open(path, 'rb') as f:
-            if needle in f.read().lower():
-                hits.append(path)
-    except OSError:
-        pass
+        out.add(raw)
+        if stray_prefix:
+            out.add(raw[1:].strip())      # a .pex string-length byte that looks printable
+        for j, ch in enumerate(raw):
+            if ch in b' ,;([{':
+                t = raw[j + 1:].strip()
+                if t:
+                    out.add(t)
+    for m in _NAME_END.finditer(data):
+        i = m.start() - 1
+        while i >= 0 and data[i] >= 0x20 and data[i] not in _NOT_IN_NAME and m.start() - i < 250:
+            i -= 1
+        add(data[i + 1:m.end()])
+    for m in _WIDE_NAME.finditer(data):
+        add(m.group(0)[::2])
+    return out
 
 
-def _scripts_mention(dirs, plugin_name, limit=20):
-    """Compiled scripts (.pex) naming the plugin: [(path, uses GetFormFromFile,
-    uses GetModByName)]. Hard-coded FormIDs break when the plugin is compacted;
-    GetModByName returns 0x100+ for light plugins, which breaks scripts that
-    compare it with 255 or build FormIDs from it."""
-    needle = plugin_name.lower().encode('utf-8')
-    hits = []
-    for base in dirs:
-        sdir = _exists_ci(base, 'Scripts')
-        if not sdir:
-            continue
+class _Mentions:
+    """Which scripts, configs and SKSE DLLs name a plugin. Every file is read
+    once per run and reduced to the plugin names it contains."""
+
+    def __init__(self, model):
+        self.model = model
+        self._dirs = {}               # (kind, folder) -> {name: [(path, flags)]}
+
+    @staticmethod
+    def _read(path, limit):
         try:
-            names = os.listdir(sdir)
+            if os.path.getsize(path) > limit:
+                return None
+            with open(path, 'rb') as f:
+                return f.read().lower()
         except OSError:
-            continue
-        for n in names:
-            if not n.lower().endswith('.pex'):
+            return None
+
+    def _index(self, kind, folder, files, limit, pex=False):
+        key = (kind, folder)
+        if key not in self._dirs:
+            idx = {}
+            for path in files:
+                data = self._read(path, limit)
+                if data is None:
+                    continue
+                flags = (b'getformfromfile' in data, b'getmodbyname' in data) if pex else ()
+                for n in _plugin_names_in(data, stray_prefix=pex):
+                    idx.setdefault(n, []).append((path, flags))
+            self._dirs[key] = idx
+        return self._dirs[key]
+
+    @staticmethod
+    def _key(name):
+        return name.lower().encode('cp1252', 'replace')
+
+    def scripts(self, dirs, plugin_name):
+        """[(path, uses GetFormFromFile, uses GetModByName)] of compiled scripts
+        (.pex) naming the plugin. Hard-coded FormIDs break when the plugin is
+        compacted; GetModByName returns 0x100+ for light plugins, which breaks
+        scripts that compare it with 255 or build FormIDs from it."""
+        out = []
+        for base in dirs:
+            sdir = _exists_ci(base, 'Scripts')
+            if not sdir:
                 continue
-            p = os.path.join(sdir, n)
             try:
-                with open(p, 'rb') as f:
-                    data = f.read().lower()
+                files = [os.path.join(sdir, n) for n in os.listdir(sdir) if n.lower().endswith('.pex')]
             except OSError:
                 continue
-            if needle in data:
-                hits.append((p, b'getformfromfile' in data, b'getmodbyname' in data))
-            if len(hits) >= limit:
-                return hits
-    return hits
+            idx = self._index('pex', sdir, files, MAX_CONFIG_SIZE, pex=True)
+            out += [(p, g, m) for p, (g, m) in idx.get(self._key(plugin_name), [])]
+        return out
+
+    def configs(self, dirs, plugin_name, deep=False):
+        """Text config files (SKSE plugin INIs, JSON, SPID/KID...) naming the plugin."""
+        out = []
+        for base in dirs:
+            if deep:
+                roots = [base]
+            else:
+                roots = []
+                key = ('cfg-root', base)
+                if key not in self._dirs:
+                    try:
+                        files = [os.path.join(base, n) for n in os.listdir(base)
+                                 if n.lower().endswith(CONFIG_EXTS) and os.path.isfile(os.path.join(base, n))]
+                    except OSError:
+                        files = []
+                    self._index('cfg-root', base, files, MAX_CONFIG_SIZE)
+                out += [p for p, _f in self._dirs[key].get(self._key(plugin_name), [])]
+                skse = _exists_ci(base, 'SKSE')
+                if skse:
+                    roots.append(skse)
+            for root in roots:
+                key = ('cfg-tree', root)
+                if key not in self._dirs:
+                    files = [os.path.join(dp, n) for dp, _dn, fn in os.walk(root) for n in fn
+                             if n.lower().endswith(CONFIG_EXTS)]
+                    self._index('cfg-tree', root, files, MAX_CONFIG_SIZE)
+                out += [p for p, _f in self._dirs[key].get(self._key(plugin_name), [])]
+        return list(dict.fromkeys(out))
+
+    def dlls(self, plugin_name):
+        """SKSE plugin DLLs that contain the plugin's name (narrow or UTF-16)."""
+        out = []
+        for d, _label in self.model.search_dirs:
+            sp = _exists_ci(d, 'SKSE', 'Plugins')
+            if not sp:
+                continue
+            try:
+                files = [os.path.join(sp, n) for n in os.listdir(sp) if n.lower().endswith('.dll')]
+            except OSError:
+                continue
+            idx = self._index('dll', sp, files, MAX_DLL_SIZE)
+            out += [os.path.basename(p) for p, _f in idx.get(self._key(plugin_name), [])]
+        return list(dict.fromkeys(out))
 
 
 def _bsa_assets(model, entry, kinds):
@@ -156,8 +219,8 @@ def _bsa_assets(model, entry, kinds):
                 continue
             try:
                 names = BSA(p).list()
-            except (EspError, OSError, ValueError):
-                continue
+            except (EspError, OSError, ValueError, IndexError, struct.error):
+                continue            # damaged archive: skip it (this check is advisory)
             for n in names:
                 nl = n.lower().replace('/', '\\')
                 if 'facegen' in kinds and ('facegendata\\facegeom\\' + low + '\\' in nl or
@@ -170,39 +233,6 @@ def _bsa_assets(model, entry, kinds):
                 if len(out) > 5:
                     return out
     return out
-
-
-class _DllIndex:
-    """Lower-cased contents of SKSE plugin DLLs, read once, for 'does a DLL
-    hard-code this plugin' checks."""
-
-    def __init__(self, model):
-        self.model = model
-        self._dlls = None
-
-    def mentions(self, plugin_name):
-        if self._dlls is None:
-            self._dlls = []
-            for d, _label in self.model.search_dirs:
-                sp = _exists_ci(d, 'SKSE', 'Plugins')
-                if not sp:
-                    continue
-                try:
-                    names = os.listdir(sp)
-                except OSError:
-                    continue
-                for n in names:
-                    p = os.path.join(sp, n)
-                    if n.lower().endswith('.dll') and os.path.isfile(p) and os.path.getsize(p) <= MAX_DLL_SIZE:
-                        try:
-                            with open(p, 'rb') as f:
-                                self._dlls.append((n, f.read().lower()))
-                        except OSError:
-                            continue
-        # names are stored as narrow or UTF-16 strings
-        needle = plugin_name.lower().encode('cp1252', 'replace')
-        wide = plugin_name.lower().encode('utf-16-le')
-        return [n for n, data in self._dlls if needle in data or wide in data]
 
 
 def _game_supports_171(model):
@@ -247,7 +277,7 @@ def analyse(model, configs=False, deep_configs=False):
         supports_171 = False          # header 1.71 is a flat-game (1.6.1130+) feature
         vr_esl = bool(model.ev.find('SKSE/Plugins/skyrimvresl.dll')) if model.search_dirs else None
     ef_fix = None
-    dlls = _DllIndex(model)
+    mentions = _Mentions(model)
     out = []
     for e in order:
         s = e.scan
@@ -341,7 +371,7 @@ def analyse(model, configs=False, deep_configs=False):
             seq = (_bsa_assets(model, e, ('seq',)) or [None])[0]
         if seq:
             flag_risks.append('has a SEQ file: its start-game dialogue may not work until you save and reload')
-        pex = _scripts_mention(dirs, e.name) if (s.has_scripts or new_sigs.get('QUST')) else []
+        pex = mentions.scripts(dirs, e.name) if (s.has_scripts or new_sigs.get('QUST')) else []
         if any(m for _p, _g, m in pex):
             flag_risks.append('a script calls GetModByName on it: for light plugins it returns 0x100 or more, so '
                               'scripts that compare the result with 255 or build FormIDs from it break')
@@ -407,12 +437,12 @@ def analyse(model, configs=False, deep_configs=False):
             c.risks.append(f'{len(hard_pex)} compiled script(s) call GetFormFromFile with "{e.name}" (hard-coded '
                            'FormIDs)')
         if configs:
-            cfg = _config_mentions(dirs if not model.search_dirs else [d for d, _ in model.search_dirs],
+            cfg = mentions.configs(dirs if not model.search_dirs else [d for d, _ in model.search_dirs],
                                    e.name, deep=deep_configs)
             if cfg:
                 c.files += cfg
                 c.risks.append(f'{len(cfg)} config file(s) mention it (SPID/KID/BOS/OAR... use its FormIDs)')
-        dll = dlls.mentions(e.name)
+        dll = mentions.dlls(e.name)
         if dll:
             hard.append(f'SKSE plugin(s) {", ".join(dll[:3])} contain its name and may hard-code its FormIDs '
                         '(ESLifier does not patch DLLs; compacting would need an updated DLL)')

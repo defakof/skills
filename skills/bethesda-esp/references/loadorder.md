@@ -33,8 +33,9 @@ loose-file priority (the mod manager's left pane) are a different topic. Facts c
    (`master-needs-nonmaster`). A light master must never depend on a regular plugin.
 5. A regular plugin loaded before its own master: behaviour is undefined (lost overrides or a
    crash); always an error.
-6. Missing or inactive masters: the game crashes on start. Exception: Bashed Patch "Filter"
-   patches (Bash Tag `Filter`) may have missing masters.
+6. Missing or inactive masters: the game crashes on start. (LOOT does not report this for Bash
+   `Filter` patches, which are meant to be merged into a Bashed Patch and deactivated - but SE's
+   Wrye Bash cannot merge plugins, so an active Filter patch still needs every master.)
 
 Light plugins (`.esl` file, or ESL flag 0x200 on any plugin) all share load index `FE`
 (`FE000`-`FEFFF`) but still **win or lose conflicts by their position** in the load order.
@@ -59,7 +60,8 @@ a master, full ones included; a plugin with an older header that overrides or re
 records of a 1.71 master breaks and must be saved as 1.71 too (`hedr-low-range`). A 1.71 plugin crashes 1.5.97/1.6.640/1.6.659 at start unless **Backported Extended ESL
 Support** (BEES, `SKSE/Plugins/BackportedESLSupport.dll`) is installed. Game 1.7.x (2026) did not
 change these rules. Form version 43 (LE) records mostly work; weapon critical data (WEAP CRDT) is
-read wrongly - re-save in the SE Creation Kit (with CK Fixes).
+read wrongly - re-save in the SE Creation Kit (current Steam CK with Creation Kit Platform
+Extended; SSE CreationKit Fixes only works with the old CK 1.5.73), then check the saved header.
 
 A light plugin with new records outside its range breaks saves permanently (LOOT error).
 
