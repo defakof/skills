@@ -51,9 +51,12 @@ does.
 | new records in a light plugin, header < 1.71 | object IDs `0x800`-`0xFFF` (2048) |
 | new records in a light plugin, header 1.71 | `0x001`-`0xFFF` (4095); needs game 1.6.1130+ (or BEES on 1.5.97-1.6.659) |
 
-Header (HEDR) versions: 0.94 = Skyrim LE (needs conversion), 1.70 = SE, 1.71 = SE after the
+Header (HEDR) versions: 0.94 = Skyrim LE (needs conversion), 1.70 = SE (some LE files are 1.70
+too: the record form version, 43 = LE / 44 = SE, is the better test), 1.71 = SE after the
 Creations update (1.6.1130, Dec 2023; xEdit 4.1.5+, Mutagen/Synthesis and ESLifier write 1.71 by
-default). A 1.71 plugin crashes 1.5.97/1.6.640/1.6.659 at start unless **Backported Extended ESL
+default). With header 1.71 the object IDs 0x001-0x7FF become usable by **every** plugin that has
+a master, full ones included; a plugin with an older header that overrides or references those
+records of a 1.71 master breaks and must be saved as 1.71 too (`hedr-low-range`). A 1.71 plugin crashes 1.5.97/1.6.640/1.6.659 at start unless **Backported Extended ESL
 Support** (BEES, `SKSE/Plugins/BackportedESLSupport.dll`) is installed. Game 1.7.x (2026) did not
 change these rules. Form version 43 (LE) records mostly work; weapon critical data (WEAP CRDT) is
 read wrongly - re-save in the SE Creation Kit (with CK Fixes).
@@ -70,9 +73,12 @@ A light plugin with new records outside its range breaks saves permanently (LOOT
   plugins are not written. `loadorder.txt` is ignored by Skyrim SE (MO2/Vortex still write it).
 - **MO2**: `<instance>/profiles/<profile>/plugins.txt` (+ `loadorder.txt`, `modlist.txt`). The
   game sees it through MO2's virtual file system - never edit the AppData copy for MO2 users.
+  MO2 takes the **order from the profile's `loadorder.txt`** when it starts (only the `*` flags
+  come from plugins.txt), so a hand-edited order must be written to both files
+  (`esp loadorder --mo2 ... --write <profile>/plugins.txt --write-loadorder <profile>/loadorder.txt`
+  with MO2 closed) - or applied in MO2 itself.
   `modlist.txt`: first line = highest priority, `+` enabled, `-` disabled; Overwrite beats
-  everything. Plugin files live in `<mods>/<mod>/`. MO2 reloads `loadorder.txt` if it is newer.
-  Close MO2 before editing its files, or apply the order in MO2.
+  everything. Plugin files live in `<mods>/<mod>/`. Close MO2 before editing its files.
 - **Vortex**: writes `%LOCALAPPDATA%` plugins.txt directly; its rules/groups live in
   `%APPDATA%\Vortex\skyrimse\userlist.yaml`, and Vortex re-sorts automatically - change the order
   through Vortex rules, not by editing plugins.txt.
@@ -152,7 +158,7 @@ references, injected records colliding, duplicate EditorIDs.
 | keyword lists (KWDA) | `esp merge` / hand-made patch (union) | Synthesis Fusion Patcher, Generic Synthesis Patcher, or KID at runtime. The Bashed Patch `Keywords` tag is last-wins, not a union |
 | item stats, names, models, sounds | Bashed Patch Import Stats/Names/Graphics/Sounds with tags | `esp merge`, Fusion Patcher |
 | NPC appearance | **NPC Plugin Chooser 2** (maintained) or EasyNPC (unmaintained) | FaceFixer/FacegenBaseline (Synthesis). The winning record and its FaceGen files must come from the same mod (dark-face bug). The Bashed Patch cannot import faces for Skyrim |
-| NPC stats, AI, factions, perks | `esp merge` | Bashed Patch Import Actors (`Actors.*`, `NPC.*`) |
+| NPC stats, AI, factions, perks | `esp merge` | Bashed Patch Import Actors (`Actors.*`, `NPC.*`); spells, perks and AI packages merge, but Import Factions is last-tagged-wins, so faction additions from two mods need `esp merge` or a hand-made patch |
 | cells (lighting, water, music, owner...) | `esp merge` | Bashed Patch Import Cells (`C.Light`, `C.Water`, ...); LOOT has cell groups |
 | races | Bashed Patch `R.*` tags | head data: hand-made patch |
 | perks (entry points), magic effects, spells | hand-made patch | stats only: EffectStats/SpellStats/EnchantmentStats tags |
@@ -171,11 +177,14 @@ Tool status (October 2026):
   (set Master Version Override 1.70 on old games without BEES). CLI: `Synthesis.CLI run-pipeline`.
   Smash-like patchers: **Synthesis Fusion Patcher** (Bash-Tag driven), **Generic Synthesis
   Patcher** (rule driven). There is no Synthesis cleaning patcher.
-- **Mator Smash**: legacy. Official 1.0.2 (2018) removes `.esl` plugins from the load order and
-  stops at 254 plugins - unusable on AE. The community fork "Unofficial Mator Smash Updated"
-  (Nexus SSE 39378, last update 2021) handles ESLs but predates header 1.71. Use only as a last
-  resort with `Smash.All`, build it after the Bashed Patch, check the result in SSEEdit (it does
-  not merge scripts or conditions and skips navmeshes).
+- **Mator Smash**: legacy; STEP staff (2023) state the consensus is to avoid Smash and zMerge in
+  favour of a Bashed Patch plus hand-made xEdit fixes. Official 1.0.2 (2018) removes `.esl`
+  plugins from the load order and stops at 254 plugins - unusable on AE. The community fork
+  "Unofficial Mator Smash Updated" (Nexus SSE 39378, 2.0.0-beta-5, last update 2021) handles ESLs
+  and adds `Smash.OverrideAll` and sub-element script (VMAD) merging for 12 record types, but is
+  beta and predates header 1.71. Use it only as a last resort with `Smash.All`, build it after
+  the Bashed Patch, and check the result in SSEEdit - especially quest/script merges; it skips
+  navmeshes.
 - **xEdit (SSEEdit)** 4.1.5q (2026), maintained; `-vqsc` shows all conflicts. Its "Create Merged
   Patch" is obsolete - do not use it.
 - **zMerge** (zEdit 0.6.7, 2022) and Merge Plugins (2016) are unmaintained; merging also breaks
@@ -238,8 +247,8 @@ light: that moves it into the master block and changes conflict winners.
 2. `esp loadorder ... --groups` - fix every **error** first (missing/inactive masters, master
    order, invalid light plugins, header 1.71 without BEES, LOOT incompatibilities).
 3. Apply the suggested order: via LOOT in the mod manager when available; otherwise
-   `esp loadorder ... --write plugins_sorted.txt`, review, then replace plugins.txt with the
-   mod manager closed. Persist custom rules in the userlist.
+   `esp loadorder ... --write plugins_sorted.txt` (MO2: also `--write-loadorder`), review, then
+   replace the files with the mod manager closed. Persist custom rules in the userlist.
 4. `esp scan ...` for a quick picture, `esp scan ... --deep` for whose changes are lost.
 5. Fix in this order: crashes (deleted navmeshes, injected collisions) -> load order -> reverted
    official/USSEP fixes -> patches that are overridden -> conflicts (high -> low).

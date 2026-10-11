@@ -206,6 +206,8 @@ class _DllIndex:
 
 def _game_supports_171(model):
     """True / False / None (unknown): can the game load header 1.71 plugins?"""
+    if model.is_vr:
+        return False
     if model.game_version:
         if tuple(model.game_version[:3]) >= V_CREATIONS:
             return True
@@ -239,6 +241,10 @@ def analyse(model, configs=False, deep_configs=False):
         for m in e.scan.masters:
             dependents.setdefault(m.lower(), []).append(e)
     supports_171 = _game_supports_171(model)
+    vr_esl = True
+    if model.is_vr:
+        supports_171 = False          # header 1.71 is a flat-game (1.6.1130+) feature
+        vr_esl = bool(model.ev.find('SKSE/Plugins/skyrimvresl.dll')) if model.search_dirs else None
     ef_fix = None
     dlls = _DllIndex(model)
     out = []
@@ -265,6 +271,13 @@ def analyse(model, configs=False, deep_configs=False):
         if model.is_generated(e):
             c.verdict = 'no'
             c.reasons.append('generated patch: it is rebuilt by its tool (set the ESL option there if it has one)')
+            out.append(c)
+            continue
+        if vr_esl is not True:
+            c.verdict = 'no'
+            c.reasons.append('Skyrim VR loads light plugins only with Skyrim VR ESL Support (SKSE plugin, Nexus '
+                             'SSE 106712)' + (', which was not found' if vr_esl is False else '') +
+                             '; install it before ESL-flagging anything')
             out.append(c)
             continue
         new_sigs = {}
@@ -302,9 +315,15 @@ def analyse(model, configs=False, deep_configs=False):
         hedr171 = s.hedr_version >= 1.705
         lo_bound = 0x001 if hedr171 else 0x800
         max_new = 0xFFF - lo_bound + 1
-        if c.n_new > 0xFFF:
+        has_sky = 'skyrim.esm' in [m.lower() for m in s.masters]
+        ok_deps = all(d.scan is not None and d.scan.hedr_version >= 1.705 and
+                      'skyrim.esm' in [m.lower() for m in d.scan.masters] for d in deps)
+        can_171 = supports_171 is not False and has_sky and ok_deps     # may use 001-7FF after header 1.71
+        cap = 0xFFF if (hedr171 or can_171) else 0x800
+        if c.n_new > cap:
             c.verdict = 'no'
-            c.reasons.append(f'{c.n_new} new records; a light plugin holds at most 2048 (4095 with header 1.71)')
+            c.reasons.append(f'{c.n_new} new records; a light plugin holds at most 2048 (4095 with header 1.71 '
+                             'on game 1.6.1130+ or BEES, when the plugin and its dependents qualify)')
             out.append(c)
             continue
         in_range = all(lo_bound <= i <= 0xFFF for i in ids)
@@ -328,6 +347,10 @@ def analyse(model, configs=False, deep_configs=False):
                              'no FormIDs change' if c.n_new else 'no new records (only overrides): set the ESL flag')
             if hedr171 and supports_171 is not True:
                 c.risks.append('header 1.71: needs game 1.6.1130+ or BEES')
+            if hedr171 and ids and min(ids) < 0x800 and not (has_sky and ok_deps):
+                old = [d.name for d in deps if d.scan is not None and d.scan.hedr_version < 1.705]
+                c.risks.append('uses object IDs below 0x800: valid only with Skyrim.esm as a master and with '
+                               'header-1.71 dependents' + (f' ({", ".join(old[:4])} are not 1.71)' if old else ''))
             if deps:
                 c.reasons.append(f'{len(deps)} plugin(s) use it as a master; they keep working (FormIDs do not change)')
             c.risks += flag_risks
@@ -335,9 +358,6 @@ def analyse(model, configs=False, deep_configs=False):
             continue
         if fits_171 and not hedr171 and supports_171 is not False:
             # fits in 0x001-0xFFF, which is valid only with header 1.71
-            ok_deps = all(d.scan is not None and d.scan.hedr_version >= 1.705 and
-                          'skyrim.esm' in [m.lower() for m in d.scan.masters] for d in deps)
-            has_sky = 'skyrim.esm' in [m.lower() for m in s.masters]
             if has_sky and ok_deps:
                 c.verdict = 'flag-171'
                 c.reasons.append(f'new records use object IDs {c.id_range}, valid for a light plugin only with '
@@ -350,6 +370,10 @@ def analyse(model, configs=False, deep_configs=False):
         # needs compaction
         c.reasons.append(f'{c.n_new} new record(s) with object IDs {c.id_range}: needs FormID compaction '
                          '(renumbering) first; existing saves will not work with it afterwards')
+        if c.n_new > 0x800:
+            c.reasons.append('more than 2048 new records: compaction must start at 0x001 and the plugin needs '
+                             'header 1.71 (esp compact <plugin> --start 0x001, then esp esl <plugin> --header-171 '
+                             '--flag; ESLifier does this by default)')
         hard = []
         if new_sigs.get('NPC_'):
             for d in dirs:

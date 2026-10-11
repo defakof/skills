@@ -121,7 +121,8 @@ esp eslify ... [--configs]                                 # which plugins can b
   warnings) plus the user's LOOT/Vortex `userlist.yaml`, then the LOOT overlap rule. Fix every
   ERROR first. Moves keep the user's order wherever no rule demands a change.
 - Apply orders through the user's tool when possible: LOOT inside MO2, Vortex rules; otherwise
-  replace plugins.txt (MO2: the profile's file) with the mod manager closed. Manual moves are
+  replace plugins.txt with the mod manager closed (MO2: the profile's plugins.txt **and**
+  loadorder.txt - `--write ... --write-loadorder ...` - because MO2 reads the order from loadorder.txt). Manual moves are
   undone by the next LOOT sort - persist them as LOOT userlist rules (`--rules` uses the same idea).
 - `scan` recommendations name the tool per conflict type: leveled lists/inventories -> Bashed
   Patch (Wrye Bash) or `esp merge`; keyword unions -> `esp merge`/Synthesis Fusion Patcher/KID;

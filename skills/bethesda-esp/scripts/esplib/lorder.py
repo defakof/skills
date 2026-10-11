@@ -232,7 +232,7 @@ def _ver_str(v):
 # ---------------------------------------------------------------------------
 
 class Entry:
-    __slots__ = ('name', 'path', 'active', 'listed', 'implicit', 'source', 'scan', 'scan_error')
+    __slots__ = ('name', 'path', 'active', 'listed', 'implicit', 'source', 'scan', 'scan_error', 'ghost')
 
     def __init__(self, name, path=None, active=True, listed=None, implicit=None, source=None):
         self.name = name
@@ -243,6 +243,7 @@ class Entry:
         self.source = source          # MO2 mod name, folder...
         self.scan = None
         self.scan_error = None
+        self.ghost = None             # path of Name.esp.ghost when only a ghosted copy exists
 
     @property
     def low(self):
@@ -330,13 +331,16 @@ class LoadOrderModel:
                 lo.game_version = pv[0] if pv else None
             elif os.path.isfile(vr_exe):
                 lo.is_vr = True
+        explicit = {}         # lower name -> path given on the command line
         if plugins:
             # explicit list: files or names, in load order, all active
             for p in plugins:
                 if os.path.isfile(p):
-                    d = os.path.dirname(os.path.abspath(p))
+                    ap = os.path.abspath(p)
+                    d = os.path.dirname(ap)
                     if all(d != x for x, _ in lo.search_dirs):
                         lo.search_dirs.append((d, os.path.basename(d) or d))
+                    explicit[os.path.basename(p).lower()] = ap
                     listed.append((os.path.basename(p), True))
                 else:
                     listed.append((p, True))
@@ -356,6 +360,17 @@ class LoadOrderModel:
                     lo.manager = 'Vortex'
                 if loadorder_txt and os.path.isfile(loadorder_txt):
                     lo._check_desync(plugins_txt, loadorder_txt, listed)
+                    if lo.manager == 'MO2':
+                        # MO2 takes the order from the profile's loadorder.txt when it starts
+                        # and only the '*' flags from plugins.txt
+                        flags = {}
+                        for n, a in listed:
+                            flags[n.lower()] = a
+                        order = read_loadorder_txt(loadorder_txt)
+                        in_lo = {n.lower() for n in order}
+                        listed = [(n, flags.get(n.lower(), False)) for n in order] + \
+                                 [(n, a) for n, a in listed if n.lower() not in in_lo]
+                        lo.source_desc += ' (order from its loadorder.txt, as MO2 reads it)'
             elif loadorder_txt and os.path.isfile(loadorder_txt):
                 listed = [(n, True) for n in read_loadorder_txt(loadorder_txt)]
                 lo.source_desc = f'loadorder.txt {loadorder_txt} (no plugins.txt: every plugin treated as active)'
@@ -385,7 +400,7 @@ class LoadOrderModel:
         elif lo.data_dir and not lo.is_vr:
             lo.ccc = list(CCC_FALLBACK)
             lo.ccc_source = 'built-in copy (Skyrim.ccc not found)'
-        lo._build_entries(listed)
+        lo._build_entries(listed, explicit)
         if not plugins and (plugins_txt or lo.data_dir):
             lo._find_unlisted()
         if scan:
@@ -400,11 +415,20 @@ class LoadOrderModel:
             found = mlist.find_userlists()
             pick = [p for p, who in found if who == ('Vortex' if self.manager == 'Vortex' else 'LOOT')]
             userlist = (pick or [p for p, _ in found] or [None])[0]
+        errors = []
+        ml_data = ul_data = None
         try:
-            self.meta = mlist.Metadata.load(masterlist, userlist or None)
+            ml_data = mlist.load_masterlist_data(masterlist)
         except Exception as ex:  # noqa: BLE001 - metadata is optional; report and continue
-            self.meta = None
-            self.meta_error = f'could not load LOOT metadata: {ex}'
+            errors.append(f'could not read the LOOT masterlist {masterlist or ""}: {ex}'.replace('  ', ' '))
+        if userlist:
+            try:
+                ul_data = mlist.load_yaml_metadata(userlist)
+            except Exception as ex:  # noqa: BLE001
+                errors.append(f'could not read the userlist {userlist}: {ex} (its rules are ignored; '
+                              'installing PyYAML may help)')
+        self.meta = mlist.Metadata(ml_data, ul_data) if (ml_data or ul_data) else None
+        self.meta_error = '; '.join(errors) or None
         self._ev = None
 
     @property
@@ -421,12 +445,16 @@ class LoadOrderModel:
         if bad:
             newer = 'loadorder.txt' if os.path.getmtime(loadorder_txt) > os.path.getmtime(plugins_txt) \
                 else 'plugins.txt'
-            self.issues.append(Issue(
-                'warning', 'lo-desync', None,
-                f'plugins.txt and loadorder.txt disagree (e.g. {bad[0][0]} / {bad[0][1]}); the game uses plugins.txt'
-                + ('; MO2 reloads the newer loadorder.txt on start and will overwrite plugins.txt'
-                   if self.manager == 'MO2' and newer == 'loadorder.txt' else ''),
-                'Re-sort or save the order in the mod manager so both files match.'))
+            if self.manager == 'MO2':
+                msg = (f'the profile\'s plugins.txt and loadorder.txt disagree (e.g. {bad[0][0]} / {bad[0][1]}); '
+                       'MO2 takes the order from loadorder.txt when it starts (shown here) and rewrites plugins.txt '
+                       f'from it ({newer} is newer)')
+            else:
+                msg = (f'plugins.txt and loadorder.txt disagree (e.g. {bad[0][0]} / {bad[0][1]}); the game only '
+                       'reads plugins.txt')
+            self.issues.append(Issue('warning', 'lo-desync', None, msg,
+                                     'Re-sort or save the order in the mod manager so both files match; when '
+                                     'editing an MO2 profile by hand, write both files in the same order.'))
 
     def find_path(self, name):
         low = name.lower()
@@ -444,7 +472,18 @@ class LoadOrderModel:
                 pass
         return None, None
 
-    def _build_entries(self, listed):
+    def _resolve(self, name, explicit=None):
+        """(path, label, ghost path) for a plugin name; a plugin that only exists
+        as Name.esp.ghost is invisible to the game, so it gets no path."""
+        if explicit and name.lower() in explicit:
+            p = explicit[name.lower()]
+            return p, os.path.basename(os.path.dirname(p)) or p, None
+        path, label = self.find_path(name)
+        if path and path.lower().endswith('.ghost') and not name.lower().endswith('.ghost'):
+            return None, label, path
+        return path, label, None
+
+    def _build_entries(self, listed, explicit=None):
         seen = {}
         entries = []
         # implicit plugins: hardcoded, then CC plugins in Skyrim.ccc order (incl. _ResourcePack.esl)
@@ -453,10 +492,11 @@ class LoadOrderModel:
         for name, kind in implicit:
             if name.lower() in seen:
                 continue
-            path, label = self.find_path(name)
+            path, label, ghost = self._resolve(name)
             if path is None and kind == 'cc':
                 continue
             e = Entry(name, path, True, None, kind, label)
+            e.ghost = ghost
             seen[name.lower()] = e
             entries.append(e)
         dup = set()
@@ -470,8 +510,9 @@ class LoadOrderModel:
                 if e.implicit is None:
                     e.active = active
                 continue
-            path, label = self.find_path(name)
+            path, label, ghost = self._resolve(name, explicit)
             e = Entry(name, path, active, i, None, label)
+            e.ghost = ghost
             seen[low] = e
             entries.append(e)
         for name in sorted(dup):
@@ -492,8 +533,10 @@ class LoadOrderModel:
                 if not is_plugin_name(n) or n.lower().endswith('.ghost'):
                     continue
                 if n.lower() not in known and n.lower() not in found and os.path.isfile(os.path.join(d, n)):
-                    found[n.lower()] = (n, label)
-        self.unlisted = sorted(found.values(), key=lambda t: t[0].lower())
+                    found[n.lower()] = (n, label, os.path.join(d, n))
+        self.unlisted = sorted(((n, label) for n, label, _p in found.values()), key=lambda t: t[0].lower())
+        for n, label, path in sorted(found.values(), key=lambda t: t[0].lower()):
+            self.entries.append(Entry(n, path, False, None, None, label))   # installed, inactive
 
     def scan_all(self, use_cache=True):
         for e in self.entries:
@@ -527,14 +570,19 @@ class LoadOrderModel:
 
     def _hoist(self, order):
         order = list(order)
+        done = set()                  # (plugin, master) pairs already hoisted: stops master cycles
         i = 0
-        guard = 0
-        while i < len(order) and guard < 100000:
-            guard += 1
+        while i < len(order):
             e = order[i]
             if self.is_master_like(e) and e.scan is not None:
                 pos = {x.low: j for j, x in enumerate(order)}
-                later = [order[pos[m.lower()]] for m in e.scan.masters if pos.get(m.lower(), -1) > i]
+                later = []
+                for m in e.scan.masters:
+                    ml = m.lower()
+                    if pos.get(ml, -1) > i and (e.low, ml) not in done:
+                        done.add((e.low, ml))
+                        later.append(order[pos[ml]])
+                later = list({x.low: x for x in later}.values())
                 if later:
                     for m in later:
                         order.remove(m)
@@ -542,6 +590,36 @@ class LoadOrderModel:
                     continue          # re-check the hoisted plugins' own masters
             i += 1
         return order
+
+    def master_cycles(self):
+        """Lists of active plugins whose masters form a cycle."""
+        graph = {}
+        for e in self.active():
+            if e.scan is not None:
+                graph[e.low] = [m.lower() for m in e.scan.masters if m.lower() != e.low]
+        names = self.by_name()
+        state, out, stack = {}, [], []
+
+        def visit(n):
+            state[n] = 1
+            stack.append(n)
+            for m in graph.get(n, ()):
+                if state.get(m) == 1:
+                    out.append([names[x].name for x in stack[stack.index(m):]])
+                elif m in graph and not state.get(m):
+                    visit(m)
+            stack.pop()
+            state[n] = 2
+        import sys
+        old = sys.getrecursionlimit()
+        sys.setrecursionlimit(max(old, 10000))
+        try:
+            for n in graph:
+                if not state.get(n):
+                    visit(n)
+        finally:
+            sys.setrecursionlimit(old)
+        return out
 
     @staticmethod
     def is_master_like(e):
@@ -610,16 +688,24 @@ class LoadOrderModel:
     def validate(self):
         issues = list(self.issues)
         if self.meta_error:
-            issues.append(Issue('info', 'no-metadata', None, self.meta_error))
+            issues.append(Issue('warning', 'loot-metadata', None, self.meta_error,
+                                'Fix or remove the file, or pass --masterlist / --userlist explicitly.'))
         order = self.effective_order()
         pos = {e.low: i for i, e in enumerate(order)}
         names = self.by_name()
         # files listed but missing
         for e in self.entries:
             if e.active and not e.path and not e.implicit:
-                issues.append(Issue('warning', 'not-found', e.name,
-                                    f'{e.name} is active in the load order file but the file was not found',
-                                    'Install it, or untick it if it was removed.'))
+                if e.ghost:
+                    issues.append(Issue('warning', 'ghosted', e.name,
+                                        f'{e.name} is active in the load order file but only the ghosted file '
+                                        f'{os.path.basename(e.ghost)} exists, so the game does not load it',
+                                        'Un-ghost it (Wrye Bash: right-click > Ghost off, or remove the .ghost '
+                                        'extension) or untick it.'))
+                else:
+                    issues.append(Issue('warning', 'not-found', e.name,
+                                        f'{e.name} is active in the load order file but the file was not found',
+                                        'Install it, or untick it if it was removed.'))
             if e.scan_error:
                 issues.append(Issue('error', 'unreadable', e.name, f'{e.name} could not be read: {e.scan_error}',
                                     'Re-download the mod; the plugin file is damaged or not a Skyrim plugin.'))
@@ -655,7 +741,7 @@ class LoadOrderModel:
             else:
                 n_full += 1
             pmeta = self.meta.for_plugin(e.name) if self.meta else None
-            tags = self.tags_of(e) if pmeta else []
+            tags = self.tags_of(e)
             filter_patch = 'Filter' in tags or re.search(r'\{\{\s*BASH\s*:[^}]*\bFilter\b', s.description or '', re.I)
             # masters
             if any(m.lower() == e.low for m in s.masters):
@@ -665,6 +751,12 @@ class LoadOrderModel:
                 me = names.get(m.lower())
                 if me is None or not me.path:
                     if filter_patch:
+                        continue
+                    if me is not None and me.ghost:
+                        issues.append(Issue('error', 'missing-master', e.name,
+                                            f'{e.name} requires {m}, which is ghosted ({os.path.basename(me.ghost)}) '
+                                            'so the game cannot see it (crash on start)',
+                                            f'Un-ghost and activate {m}, or disable {e.name}.', [m]))
                         continue
                     issues.append(Issue('error', 'missing-master', e.name,
                                         f'{e.name} requires {m}, which is not installed (the game will crash on start)',
@@ -707,6 +799,21 @@ class LoadOrderModel:
                                         'or edits weapons.'))
             if s.hedr_version >= 1.705 and not e.implicit:
                 hedr171.append(e.name)
+            elif s.hedr_version < 1.705 and not e.implicit:
+                low = {}
+                for fid in s.formids:
+                    idx = fid >> 24
+                    if idx < len(s.masters) and (fid & 0xFFFFFF) < 0x800:
+                        low[idx] = low.get(idx, 0) + 1
+                for idx, n in low.items():
+                    me = names.get(s.masters[idx].lower())
+                    if me is not None and not me.implicit and me.scan is not None and me.scan.hedr_version >= 1.705:
+                        issues.append(Issue('warning', 'hedr-low-range', e.name,
+                                            f'{e.name} (header {s.hedr_version:.2f}) overrides {n} record(s) with '
+                                            f'object IDs below 0x800 from {me.name} (header 1.71); such plugins '
+                                            'must be header 1.71 too or those references break',
+                                            f'Save {e.name} with header 1.71 (SSEEdit 4.1.5+; game 1.6.1130+ or BEES).',
+                                            [me.name]))
             if s.is_light and not e.implicit:
                 own_ids = s.new_ids()
                 lo_bound = 0x000 if s.hedr_version >= 1.705 else 0x800
@@ -721,8 +828,11 @@ class LoadOrderModel:
                 if new_cells:
                     issues.append(Issue('warning', 'esl-new-cell', e.name,
                                         f'{e.name} is a light plugin that adds {new_cells} new CELL record(s); '
-                                        'new cells in light plugins can lose their changes (reset) in game',
-                                        'Keep new cells in a full (non-ESL) plugin.'))
+                                        'such cells lose temporary references when other plugins override them '
+                                        'and interior cells reload wrongly, unless SSE Engine Fixes 7.0.13+ '
+                                        '(bESLCELLLoadBug) is installed',
+                                        'Install SSE Engine Fixes 7.0.13+, or keep new cells in a full (non-ESL) '
+                                        'plugin.'))
             if pmeta is not None:
                 issues += self._meta_issues(e, pmeta)
                 if self.is_master_like(e):
@@ -735,6 +845,11 @@ class LoadOrderModel:
                                                 'interaction" error while both are installed',
                                                 'Remove that load-after/requirement rule from the userlist, or '
                                                 'disable one of the plugins.', [te.name]))
+        for cyc in self.master_cycles():
+            issues.append(Issue('error', 'master-cycle', cyc[0],
+                                'these plugins list each other as masters (no load order can work): '
+                                + ' -> '.join(cyc + [cyc[0]]),
+                                'The plugins are broken or mismatched versions; reinstall them.', cyc[1:]))
         # limits
         max_full = 254 if n_light else 255
         if n_full > max_full:
@@ -805,10 +920,10 @@ class LoadOrderModel:
             out.append(Issue('warning', 'synthesis-split', order[syn[0]].name,
                              'Synthesis split files (Synthesis.esp, Synthesis_2.esp...) must load next to each '
                              'other', 'Move them together, in order.', [order[i].name for i in syn]))
-        first = gen[0]
-        late = [e for e in order[first + 1:] if not self.is_generated(e) and not e.implicit
-                and not self.is_master_like(e)]
-        if late and not self.is_master_like(order[first]):
+        first = next((i for i in gen if not self.is_master_like(order[i])), None)
+        late = [] if first is None else [e for e in order[first + 1:] if not self.is_generated(e)
+                                         and not e.implicit and not self.is_master_like(e)]
+        if late:
             out.append(Issue('warning', 'after-generated', order[first].name,
                              f'{len(late)} plugin(s) load after the generated patch {order[first].name}: '
                              f'{", ".join(e.name for e in late[:5])}{" ..." if len(late) > 5 else ""}; their '
@@ -851,7 +966,9 @@ class LoadOrderModel:
         for name, item, src in mlist.evaluate_items(pm.req, ev):
             disp = item.get('d', name) if isinstance(item, dict) else name
             constraint = item.get('k') if isinstance(item, dict) else None
-            present = ev.f_file(('str', name)) if not constraint else ev.eval(constraint)
+            present = ev.f_file(('str', name))
+            if constraint:
+                present = mlist._and3([present, ev.eval(constraint)])
             if present is False:
                 det = item.get('t', '') if isinstance(item, dict) else ''
                 out.append(Issue('error', 'loot-requires', e.name,
@@ -936,7 +1053,8 @@ class LoadOrderModel:
         rules = rules or {}
         notes = []
         names = {e.low: e for e in cur}
-        meta = self.meta if use_groups else None
+        rule_meta = self.meta
+        meta = self.meta if use_groups else None          # group metadata
         if meta is not None and meta.group_cycle():
             notes.append(f'LOOT groups form a cycle around "{meta.group_cycle()}"; groups ignored')
             meta = None
@@ -971,9 +1089,9 @@ class LoadOrderModel:
                     if ml in members and ml != e.low:
                         hard_edge(ml, e.low, f'{m} is a master of {e.name}')
             # 2. LOOT requirements and load-after rules (masterlist + userlist)
-            if meta is not None:
+            if rule_meta is not None:
                 for e in sorted(part, key=lambda x: x.low):
-                    pm = meta.for_plugin(e.name)
+                    pm = rule_meta.for_plugin(e.name)
                     for kind, items in (('requires', pm.req), ('loads after', pm.after)):
                         for name, _item, src in mlist.evaluate_items(items, self.ev):
                             nl = name.lower()
@@ -1120,33 +1238,30 @@ class DynTopo:
 
 
 def _lcs_keep(a, b):
-    """Set of items of b that are part of a longest common subsequence of a and b."""
-    n, m = len(a), len(b)
-    if n * m > 4_000_000:          # very long lists: keep items whose relative order is unchanged
-        pos = {x: i for i, x in enumerate(a)}
-        keep, last = set(), -1
-        for x in b:
-            if pos[x] > last:
-                keep.add(x)
-                last = pos[x]
-        return keep
-    dp = [[0] * (m + 1) for _ in range(n + 1)]
-    for i in range(n - 1, -1, -1):
-        ai = a[i]
-        row, nxt = dp[i], dp[i + 1]
-        for j in range(m - 1, -1, -1):
-            row[j] = nxt[j + 1] + 1 if ai == b[j] else max(nxt[j], row[j + 1])
-    keep = set()
-    i = j = 0
-    while i < n and j < m:
-        if a[i] == b[j]:
-            keep.add(a[i])
-            i += 1
-            j += 1
-        elif dp[i + 1][j] >= dp[i][j + 1]:
-            i += 1
+    """Items of b that are part of a longest common subsequence of a and b.
+    a and b hold the same items, so this is a longest increasing subsequence of
+    the positions (O(n log n), exact for any size). Scanning b backwards makes
+    ties keep the earlier plugins in place, so the plugins reported as moved are
+    the ones pushed down (a dependent moving below its master)."""
+    import bisect
+    pos = {x: i for i, x in enumerate(a)}
+    seq = [pos[x] for x in b if x in pos]
+    tails, tails_idx, prev = [], [], {}
+    for i in range(len(seq) - 1, -1, -1):          # longest decreasing run, backwards
+        v = -seq[i]
+        k = bisect.bisect_left(tails, v)
+        if k == len(tails):
+            tails.append(v)
+            tails_idx.append(i)
         else:
-            j += 1
+            tails[k] = v
+            tails_idx[k] = i
+        prev[i] = tails_idx[k - 1] if k else -1
+    keep = set()
+    i = tails_idx[-1] if tails_idx else -1
+    while i >= 0:
+        keep.add(a[seq[i]])
+        i = prev[i]
     return keep
 
 

@@ -54,6 +54,18 @@ class Advice:
                 'records': self.records[:50]}
 
 
+def _records_arg(keys, sigs, limit=8):
+    """(merge-command record selection, trailing note). Few records are listed;
+    for many, select by record type (merge then takes every record of those
+    types that two or more of the sources change)."""
+    keys = list(dict.fromkeys(keys))
+    if len(keys) <= limit:
+        return '--records ' + ' '.join(keys), ''
+    return ('-t ' + ','.join(sorted(sigs)),
+            f' ({len(keys)} records: this merges every {"/".join(sorted(sigs))} record that two or more of the '
+            'sources change; esp scan --json lists the exact records)')
+
+
 def _q(name):
     return f'"{name}"' if ' ' in name else name
 
@@ -156,8 +168,9 @@ def from_overridden_patches(over):
                           'A compatibility patch only works where its records win; here a later plugin that does '
                           'not include the patch\'s changes overrides it.',
                           [f'If {winner} does not need to win those records, load {patch} after it.',
-                           f'Otherwise make a small patch on top of both: esp merge {_q(patch)} {_q(winner)} --into '
-                           f'"Patch.esp" --records {" ".join(c.formkey for c in cs[:6])}'],
+                           'Otherwise make a small patch on top of both: esp merge {} {} --into "Patch.esp" {}{}'
+                           .format(_q(patch), _q(winner), *_records_arg([c.formkey for c in cs],
+                                                                         {c.sig for c in cs}))],
                           ['esp-merge', 'xedit'], [patch, winner], [f'{c.sig} {c.formkey}' for c in cs]))
     return out
 
@@ -195,7 +208,9 @@ def from_conflicts(conflicts, deep=False, scanner=None):
             for c in cs:
                 st = (c.deep or {}).get('status', 'unknown')
                 statuses[st] = statuses.get(st, 0) + 1
-            todo = [c for c in cs if (c.deep or {}).get('status') in ('lists', 'forwardable', 'clash')]
+            # not compared (beyond --max-deep): fall back to the quick rule
+            todo = [c for c in cs if (c.deep or {}).get('status') in ('lists', 'forwardable', 'clash')
+                    or (c.deep is None and not c.patched)]
             if not todo:
                 continue            # identical / resolved: nothing lost
         else:
@@ -214,7 +229,12 @@ def from_conflicts(conflicts, deep=False, scanner=None):
             why_bits.append(f'{len(patched)} already handled by a patch that has the others as masters')
         if not deep:
             why_bits.append('only the winner\'s version is used; run "esp scan --deep" to see whose changes are lost')
-        how, tools = _how(cat, todo, plugins, deep, tags)
+        gen = {p for p in plugins if model is not None and scanner.by_low.get(p.lower()) is not None
+               and model.is_generated(scanner.by_low[p.lower()])}
+        merge_plugins = [p for p in plugins if p not in gen]
+        how, tools = _how(cat, todo, merge_plugins if len(merge_plugins) >= 2 else plugins, deep, tags)
+        if deep and any(c.deep is None for c in todo):
+            why_bits.append(f'{sum(1 for c in todo if c.deep is None)} not compared (raise --max-deep)')
         tagged = [(p, relevant_tags(cat, tags(p))) for p in plugins if p != winner]
         tagged = [(p, t) for p, t in tagged if t]
         if tagged:
@@ -261,7 +281,7 @@ def _how(cat, cs, plugins, deep, tags=None):
     """Concrete steps (and tools) for one conflict group."""
     tags = tags or (lambda name: [])
     pl = ' '.join(_q(p) for p in plugins)
-    recs = ' '.join(c.formkey for c in cs[:6]) + (' ...' if len(cs) > 6 else '')
+    recs, recs_note = _records_arg([c.formkey for c in cs], {c.sig for c in cs})
     kinds = set()
     npc_kind = set()
     for c in cs:
@@ -270,7 +290,7 @@ def _how(cat, cs, plugins, deep, tags=None):
         if d.get('npc'):
             npc_kind.add(d['npc'])
     lost = _lost_entries(cs)
-    merge_cmd = f'esp merge {pl} --into "Patch.esp" --records {recs}'
+    merge_cmd = f'esp merge {pl} --into "Patch.esp" {recs}{recs_note}'
     if cat == 'navmesh':
         return (['Not auto-mergeable (the Bashed Patch, Smash and Synthesis mergers all skip navmeshes). Use the '
                  'navmesh patch from the mod pages if one exists; otherwise choose the winner by load order or '
@@ -281,7 +301,7 @@ def _how(cat, cs, plugins, deep, tags=None):
         return (['Quests, dialogue, scenes and AI packages carry scripts (VMAD) and conditions that no automatic '
                  'tool merges: use the authors\' compatibility patch if there is one.',
                  f'Otherwise compare (esp conflicts {pl} --details) and patch by hand: esp copy <winner> <record> '
-                 '--to Patch.esp, then forward the other mod\'s changes with esp set (or in SSEEdit).'],
+                 '--to Patch.esp --create, then forward the other mod\'s changes with esp set (or in SSEEdit).'],
                 ['xedit', 'esp-copy'])
     if cat == 'leveled':
         steps = ['Build a Bashed Patch (Wrye Bash 315+, Leveled Lists): the standard merge for leveled lists; LOOT '
@@ -345,7 +365,8 @@ def _how(cat, cs, plugins, deep, tags=None):
                 ['esp-merge', 'bashed', 'xedit'])
     if cat == 'settings':
         return (['Only one value can win: the last plugin decides. Reorder if you prefer the other value, or set '
-                 'it in a patch (esp copy ... --to Patch.esp; esp set Patch.esp <GMST> DATA=<value>).'],
+                 'it in a patch (esp copy <winner> <record> --to Patch.esp --create; esp set Patch.esp <record> '
+                 'DATA=<value>).'],
                 ['esp-copy'])
     if cat == 'placed':
         return (['Usually fine to let load order decide (one mod moves or edits the object). If one mod deletes '
@@ -432,10 +453,10 @@ def from_checks(dirty, navcells, edid_dups, collisions, reverts, scanner):
                           '(esp scan --deep shows which fields).',
                           ([f'Look for a USSEP-compatible version or patch of {plugin} on its mod page.']
                            if unofficial else []) +
-                          [f'Forward the fixes into a patch that loads after {plugin}: esp merge '
-                           f'{" ".join(_q(f) for f in fixers)} {_q(plugin)} --into "Patch.esp" --records ' +
-                           ' '.join(scanner.formkey(k) for k in keys[:6]) +
-                           (' ...' if len(keys) > 6 else '')],
+                          ['Forward the fixes into a patch that loads after {}: esp merge {} {} --into "Patch.esp" '
+                           '{}{}'.format(plugin, ' '.join(_q(f) for f in fixers), _q(plugin),
+                                         *_records_arg([scanner.formkey(k) for k in keys],
+                                                       {scanner.versions[k][0].sig for k in keys}))],
                           ['esp-merge', 'xedit'], [plugin] + list(fixers)))
     return out
 
@@ -475,8 +496,10 @@ def from_eslify(cands, n_full, max_full=254, steps=None):
                           'SKSE configs and dependent plugins must be patched to match. '
                           + '; '.join(f'{c.entry.name}: {"; ".join(c.risks)}' for c in care[:4]),
                           ['Use ESLifier for these (it patches the dependent files); only on a new game.'] +
-                          [f'Nothing found that depends on their FormIDs: {", ".join(c.entry.name for c in compact[:8])}'
-                           f' (esp compact <plugin> then esp esl <plugin> --flag also works for these)'
+                          [f'No FaceGen, voice files, scripts, SKSE/INI configs or dependent plugins found for: '
+                           f'{", ".join(c.entry.name for c in compact[:8])} (esp compact <plugin>, then esp esl '
+                           '<plugin> --flag, also works for these; check esp eslify --configs --deep-configs first '
+                           'if configs live in other mod folders)'
                            if compact else ''] + steps[2:],
                           ['eslifier'], [c.entry.name for c in compact + care]))
         out[-1].how = [h for h in out[-1].how if h]

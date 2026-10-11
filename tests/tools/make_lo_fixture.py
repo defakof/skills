@@ -148,6 +148,7 @@ def build(out):
     ops.place_record(b, nav_b, {'cell': b_cell.formid, 'child_type': 9})
     b_q = copy(lo, us, 'MQ101', b)
     edit(lo, b, b_q, ('FULL', '=', 'Unbound (ModB)'))
+    add_navmesh(b, b_cell, payload=b'\x0e\x0f')                  # a second, new navmesh in the same cell
     b.save(backup=False)
 
     # ---- ModA + ModB patch -------------------------------------------------------------

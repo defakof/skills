@@ -533,3 +533,320 @@ class TestCli(LoBase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class Mini:
+    """A tiny load order built in a temp folder, for one scenario."""
+
+    def __init__(self, root):
+        from esplib import Plugin
+        self.Plugin = Plugin
+        self.root = root
+        self.data = os.path.join(root, 'Data')
+        os.makedirs(self.data)
+        self.lo = LoadOrder(self.data)
+        self.plugins = {}
+        self.order = []
+        self.new('Skyrim.esm', [], esm=True)
+
+    def new(self, name, masters, active=True, **kw):
+        p = self.Plugin.new(name, masters, **kw)
+        p.path = os.path.join(self.data, name)
+        self.lo.add(p)
+        self.plugins[name] = p
+        if name.lower() not in lorder.HARDCODED_LOW:
+            self.order.append((name, active))
+        return p
+
+    def rec(self, plugin, sig, edid, fields=()):
+        from esplib import ops
+        return ops.new_record(self.plugins[plugin], sig, edid, list(fields), lo=self.lo)
+
+    def copy(self, src, edid, dst, *edits):
+        from esplib import ops
+        s = self.plugins[src]
+        new, _ = ops.copy_record(self.lo, s, s.find_edid(edid), self.plugins[dst])
+        if edits:
+            ops.apply_edits(self.lo, self.plugins[dst], new, list(edits))
+        return new
+
+    def save(self, plugins_txt=True):
+        for p in self.plugins.values():
+            p.save(backup=False)
+        if plugins_txt:
+            with open(os.path.join(self.root, 'plugins.txt'), 'w') as f:
+                f.write(''.join(('*' if a else '') + n + '\n' for n, a in self.order))
+        return self
+
+    def model(self, **kw):
+        kw.setdefault('userlist', '')
+        kw.setdefault('plugins_txt', os.path.join(self.root, 'plugins.txt'))
+        return lorder.LoadOrderModel.from_sources(data=self.data, **kw)
+
+
+class TestReviewFixes(LoBase):
+    """Regression tests for problems found in review."""
+
+    def mini(self, name):
+        return Mini(os.path.join(self.tmp, 'mini_' + name))
+
+    def codes(self, model):
+        return [(i.code, i.plugin) for i in model.validate()]
+
+    def test_after_generated_with_dyndolod_esm(self):
+        m = self.mini('dyn')
+        for n in ('ModA.esp', 'Bashed Patch, 0.esp', 'ModC.esp'):
+            m.new(n, ['Skyrim.esm'])
+        m.new('DynDOLOD.esm', ['Skyrim.esm'], esm=True)
+        m.new('DynDOLOD.esp', ['Skyrim.esm', 'DynDOLOD.esm'])
+        model = m.save().model()
+        iss = [i for i in model.validate() if i.code == 'after-generated']
+        self.assertEqual(len(iss), 1)
+        self.assertEqual(iss[0].plugin, 'Bashed Patch, 0.esp')
+        self.assertEqual(iss[0].related, ['ModC.esp'])
+
+    def test_no_groups_keeps_loot_rules(self):
+        m = self.mini('nogroups')
+        m.new('A.esp', ['Skyrim.esm'])
+        m.new('B.esp', ['Skyrim.esm'])
+        m.save()
+        ul = self.userlist("plugins:\n  - name: 'A.esp'\n    after: [ 'B.esp' ]\n")
+        model = m.model(userlist=ul)
+        for kw in ({}, {'use_groups': False}):
+            order, _mv, _n = model.sort(**kw)
+            names = [e.name for e in order]
+            self.assertLess(names.index('B.esp'), names.index('A.esp'), kw)
+
+    def test_unlisted_master_is_inactive_not_missing(self):
+        m = self.mini('unlisted')
+        m.new('Base.esp', ['Skyrim.esm'], active=False)
+        m.new('Patch.esp', ['Skyrim.esm', 'Base.esp'])
+        m.save()
+        m.order = [x for x in m.order if x[0] != 'Base.esp']            # not in plugins.txt at all
+        m.save()
+        ul = self.userlist("plugins:\n  - name: 'Patch.esp'\n    req: [ 'Base.esp' ]\n")
+        codes = self.codes(m.model(userlist=ul))
+        self.assertIn(('inactive-master', 'Patch.esp'), codes)
+        self.assertNotIn(('missing-master', 'Patch.esp'), codes)
+        self.assertNotIn(('loot-requires', 'Patch.esp'), codes)
+        self.assertIn(('unlisted', 'Base.esp'), codes)
+
+    def test_explicit_file_wins_over_data_copy(self):
+        m = self.mini('explicit')
+        m.new('Other.esp', ['Skyrim.esm'])
+        m.new('MyMod.esp', ['Skyrim.esm'])
+        m.save()
+        work = os.path.join(m.root, 'work')
+        os.makedirs(work)
+        p = m.Plugin.new('MyMod.esp', ['Skyrim.esm', 'Other.esp'])
+        p.path = os.path.join(work, 'MyMod.esp')
+        p.save(backup=False)
+        model = lorder.LoadOrderModel.from_sources(plugins=[p.path], data=m.data, userlist='')
+        e = model.by_name()['mymod.esp']
+        self.assertEqual(os.path.normcase(e.path), os.path.normcase(p.path))
+        self.assertEqual(e.scan.masters, ['Skyrim.esm', 'Other.esp'])
+
+    def test_userlist_plain_scalars_and_bad_userlist(self):
+        text = ("plugins:\n  - name: Bashed Patch, 0.esp\n    after:\n      - Foo [SE].esp\n"
+                "  - name: Tom's Patch.esp  # comment\n    group: Late Loaders\n")
+        got = ml.MiniYaml(text).parse()
+        self.assertEqual(got['plugins'][0], {'name': 'Bashed Patch, 0.esp', 'after': ['Foo [SE].esp']})
+        self.assertEqual(got['plugins'][1]['name'], "Tom's Patch.esp")
+        bad = self.userlist("plugins:\n  - name: [unterminated\n")
+        m = self.model(userlist=bad)
+        self.assertIsNotNone(m.meta)                                   # masterlist still loaded
+        self.assertIn('loot-metadata', [i.code for i in m.validate()])
+        self.assertEqual(m.group_of(m.by_name()['bashed patch, 0.esp']), 'Dynamic Patches')
+
+    def test_ghosted_active_plugin(self):
+        m = self.mini('ghost')
+        m.new('Base.esp', ['Skyrim.esm'])
+        m.new('Patch.esp', ['Skyrim.esm', 'Base.esp'])
+        m.save()
+        os.rename(os.path.join(m.data, 'Base.esp'), os.path.join(m.data, 'Base.esp.ghost'))
+        model = m.model()
+        self.assertNotIn('Base.esp', [e.name for e in model.effective_order()])
+        codes = self.codes(model)
+        self.assertIn(('ghosted', 'Base.esp'), codes)
+        self.assertIn(('missing-master', 'Patch.esp'), codes)
+
+    def test_hoist_duplicates_and_master_cycle(self):
+        m = self.mini('hoist')
+        m.new('M.esm', ['Skyrim.esm', 'Dep.esp', 'dep.esp'], esm=True)
+        m.new('Dep.esp', ['Skyrim.esm'])
+        m.new('M1.esm', ['Skyrim.esm', 'M2.esm'], esm=True)
+        m.new('M2.esm', ['Skyrim.esm', 'M1.esm'], esm=True)
+        for i in range(300):
+            m.new(f'Filler{i}.esp', ['Skyrim.esm'])
+        t = time.time()
+        model = m.save().model()
+        names = [e.name for e in model.effective_order()]
+        self.assertEqual(names.index('Dep.esp') + 1, names.index('M.esm'))
+        self.assertIn('master-cycle', [c for c, _p in self.codes(model)])
+        self.assertLess(time.time() - t, 20)
+
+    def test_lcs_large_single_move(self):
+        a = [f'p{i}' for i in range(2500)]
+        b = [a[-1]] + a[:-1]
+        self.assertEqual(len(lorder._lcs_keep(a, b)), 2499)
+
+    def test_requirement_constraint_needs_file(self):
+        m = self.mini('constraint')
+        m.new('Patch.esp', ['Skyrim.esm'])
+        m.save()
+        ul = self.userlist("plugins:\n  - name: 'Patch.esp'\n    req:\n      - name: 'Missing.esp'\n"
+                           "        constraint: 'version(\"Missing.esp\", <, \"3.1\")'\n")
+        self.assertIn(('loot-requires', 'Patch.esp'), self.codes(m.model(userlist=ul)))
+
+    def test_filter_tag_without_loot(self):
+        m = self.mini('filter')
+        m.new('FilterPatch.esp', ['Skyrim.esm', 'Gone.esp'])
+        m.save()
+        os.makedirs(os.path.join(m.data, 'BashTags'))
+        with open(os.path.join(m.data, 'BashTags', 'FilterPatch.txt'), 'w') as f:
+            f.write('Filter\n')
+        codes = self.codes(m.model(masterlist='none'))
+        self.assertNotIn(('missing-master', 'FilterPatch.esp'), codes)
+
+    def test_hedr_low_range_dependent(self):
+        m = self.mini('lowrange')
+        m.new('New171.esp', ['Skyrim.esm'], hedr_version=1.71)
+        m.new('Old170.esp', ['Skyrim.esm', 'New171.esp'])
+        from esplib.core import Record, Subrecord
+        from esplib import ops
+        r = Record('KYWD', (1 << 24) | 0x100, 0, [Subrecord('EDID', b'LowKw\0')], 44)
+        r._raw = None
+        ops.place_record(m.plugins['New171.esp'], r, {})
+        o = Record('KYWD', (1 << 24) | 0x100, 0, [Subrecord('EDID', b'LowKw\0')], 44)
+        o._raw = None
+        ops.place_record(m.plugins['Old170.esp'], o, {})
+        self.assertIn(('hedr-low-range', 'Old170.esp'), self.codes(m.save().model()))
+
+    def test_mo2_reads_loadorder_txt(self):
+        m = self.mini('mo2order')
+        m.new('A.esp', ['Skyrim.esm'])
+        m.new('B.esp', ['Skyrim.esm'])
+        m.save(plugins_txt=False)
+        inst = os.path.join(m.root, 'mo2')
+        prof = os.path.join(inst, 'profiles', 'P')
+        os.makedirs(prof)
+        with open(os.path.join(inst, 'ModOrganizer.ini'), 'w') as f:
+            f.write('[General]\ngamePath=@ByteArray(%s)\n' % m.root.replace('\\', '\\\\'))
+        with open(os.path.join(prof, 'plugins.txt'), 'w') as f:
+            f.write('*A.esp\n*B.esp\n')
+        with open(os.path.join(prof, 'loadorder.txt'), 'w') as f:
+            f.write('Skyrim.esm\nB.esp\nA.esp\n')
+        model = lorder.LoadOrderModel.from_sources(mo2_profile=prof, userlist='')
+        names = [e.name for e in model.effective_order()]
+        self.assertLess(names.index('B.esp'), names.index('A.esp'))
+        self.assertIn('lo-desync', [i.code for i in model.validate()])
+        import esp
+        out = os.path.join(m.root, 'lo_out.txt')
+        esp.write_loadorder_txt(out, model, model.effective_order())
+        with open(out, encoding='utf-8') as f:
+            lines = [x for x in f.read().splitlines() if not x.startswith('#')]
+        self.assertEqual(lines, ['Skyrim.esm', 'B.esp', 'A.esp'])
+
+
+class TestReviewFixesScan(LoBase):
+    def mini(self, name):
+        return Mini(os.path.join(self.tmp, 'scan_' + name))
+
+    def test_fixer_order_and_reverted_not_clash(self):
+        m = self.mini('fixers')
+        m.rec('Skyrim.esm', 'WEAP', 'SwordA', [('DATA', {'value': 1, 'weight': 9.0, 'damage': 5})])
+        m.rec('Skyrim.esm', 'WEAP', 'SwordB', [('DATA', {'value': 1, 'weight': 9.0, 'damage': 5})])
+        m.new('Update.esm', ['Skyrim.esm'], esm=True)
+        m.copy('Skyrim.esm', 'SwordB', 'Update.esm', ('DATA.weight', '=', '8.5'))
+        us = 'Unofficial Skyrim Special Edition Patch.esp'
+        m.new(us, ['Skyrim.esm', 'Update.esm'], esm=True)
+        m.copy('Skyrim.esm', 'SwordA', us, ('DATA.value', '=', '2'))
+        m.copy('Update.esm', 'SwordB', us, ('DATA.weight', '=', '8.0'))
+        m.new('Mod.esp', ['Skyrim.esm'])
+        m.copy('Skyrim.esm', 'SwordA', 'Mod.esp', ('DATA.damage', '=', '6'))
+        m.copy('Skyrim.esm', 'SwordB', 'Mod.esp', ('DATA.damage', '=', '6'))
+        model = m.save().model()
+        sc = conflicts.Scanner(model)
+        rev = sc.official_reverts()['Mod.esp']
+        self.assertEqual(rev['fixers'], ['Update.esm', us])                  # load order
+        dc = conflicts.DeepComparer(sc, LoadOrder(m.data))
+        swb = [c for c in sc.conflicts() if c.objid == m.plugins['Skyrim.esm'].find_edid('SwordB').formid & 0xFFFFFF]
+        res = dc.compare(swb[0])
+        kinds = {k for l in res['losers'] for f, k, _d in l['lost'] if f == 'DATA.weight'}
+        self.assertEqual(kinds, {'reverted'})
+
+    def test_generated_winner_and_injected_chain_and_navmesh_patch(self):
+        m = self.mini('gen')
+        m.rec('Skyrim.esm', 'LVLI', 'LSwords', [('LVLD', 0)])
+        cell = m.rec('Skyrim.esm', 'CELL', 'SomeCell', [('DATA', {'flags': ['Interior']})])
+        nav = make_lo_fixture.add_navmesh(m.plugins['Skyrim.esm'], cell)
+        for n in ('ModA.esp', 'ModB.esp'):
+            m.new(n, ['Skyrim.esm'])
+            m.copy('Skyrim.esm', 'LSwords', n)
+        m.new('ModA - ModB Patch.esp', ['Skyrim.esm', 'ModA.esp', 'ModB.esp'])
+        m.copy('ModB.esp', 'LSwords', 'ModA - ModB Patch.esp')
+        m.new('Synthesis.esp', ['Skyrim.esm', 'ModA.esp', 'ModB.esp'])
+        m.copy('ModA - ModB Patch.esp', 'LSwords', 'Synthesis.esp')
+        model = m.save().model()
+        sc = conflicts.Scanner(model)
+        confl = sc.conflicts()
+        self.assertTrue(all(c.patched for c in confl if c.sig == 'LVLI'))
+        self.assertEqual(sc.overridden_patches(confl), {})
+        # injected record overridden by two plugins that both build on the injector
+        m2 = self.mini('inject')
+        from esplib.core import Record, Subrecord
+        from esplib import ops
+        m2.new('Fixes.esp', ['Skyrim.esm'])
+        r = Record('MISC', 0x00ABCDEF, 0, [Subrecord('EDID', b'Inj\0')], 44)
+        r._raw = None
+        ops.place_record(m2.plugins['Fixes.esp'], r, {})
+        for n in ('ModA.esp', 'ModB.esp'):
+            m2.new(n, ['Skyrim.esm', 'Fixes.esp'])
+            m2.copy('Fixes.esp', 'Inj', n)
+        sc2 = conflicts.Scanner(m2.save().model())
+        self.assertEqual(sc2.injected()[1], [])
+        # two different navmeshes in one cell, then a navmesh patch on top of both
+        m3 = self.mini('nav')
+        m3.rec('Skyrim.esm', 'CELL', 'NavCell', [('DATA', {'flags': ['Interior']})])
+        for n in ('NavA.esp', 'NavB.esp'):
+            p = m3.new(n, ['Skyrim.esm'])
+            c3 = m3.copy('Skyrim.esm', 'NavCell', n)
+            make_lo_fixture.add_navmesh(p, c3)
+        model3 = m3.save().model()
+        self.assertEqual(len(conflicts.Scanner(model3).navmesh_cells()), 1)
+        p = m3.new('NavA - NavB Patch.esp', ['Skyrim.esm', 'NavA.esp', 'NavB.esp'])
+        c3 = m3.copy('Skyrim.esm', 'NavCell', 'NavA - NavB Patch.esp')
+        make_lo_fixture.add_navmesh(p, c3)
+        self.assertEqual(conflicts.Scanner(m3.save().model()).navmesh_cells(), [])
+        self.assertTrue(nav)
+
+    def test_eslify_vr_and_record_cap(self):
+        m = self.mini('vr')
+        m.new('Small.esp', ['Skyrim.esm'])
+        m.rec('Small.esp', 'KYWD', 'SmallKw')
+        m.save()
+        with open(os.path.join(m.root, 'SkyrimVR.exe'), 'wb') as f:
+            f.write(b'MZ')
+        res = {c.entry.name: c for c in eslify.analyse(m.model())}
+        self.assertEqual(res['Small.esp'].verdict, 'no')
+        self.assertTrue(any('VR ESL Support' in r for r in res['Small.esp'].reasons))
+        m2 = self.mini('cap')
+        p = m2.new('Big.esp', ['Skyrim.esm'])
+        p.set_hedr(next_object_id=0x5000)
+        for i in range(2100):
+            m2.rec('Big.esp', 'KYWD', f'BigKw{i}')
+        res = {c.entry.name: c for c in eslify.analyse(m2.save().model())}
+        big = res['Big.esp']
+        self.assertIn(big.verdict, ('compact', 'compact-care'))      # game version unknown: possible with 1.71
+        self.assertTrue(any('0x001' in r for r in big.reasons))
+
+    def test_advice_commands_are_runnable(self):
+        many = []
+        for i in range(12):
+            many.append(type('C', (), {'formkey': f'{0x800 + i:06X}:Skyrim.esm', 'sig': 'LVLI', 'deep': None})())
+        how, _tools = advice._how('leveled', many, ['A.esp', 'B.esp'], False)
+        cmd = [h for h in how if 'esp merge' in h][0]
+        self.assertNotIn(' ...', cmd.split('(')[0])
+        self.assertIn('-t LVLI', cmd)
+        how, _tools = advice._how('quests', many[:1], ['A.esp', 'B.esp'], False)
+        self.assertTrue(any('--create' in h for h in how))

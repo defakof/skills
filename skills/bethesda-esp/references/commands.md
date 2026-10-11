@@ -190,18 +190,24 @@ These commands share the load-order options:
 Without `--plugins-txt`/`--mo2`, plugins.txt is looked for in `%LOCALAPPDATA%` (Steam/GOG/Epic/MS
 folder chosen from the game folder) and the Proton prefix.
 
-### loadorder [options] [--rules FILE] [--write FILE] [--groups] [--sources] [--all] [--brief] [--full-order] [--no-overlap] [--no-groups] [--json]
+### loadorder [options] [--rules FILE] [--write FILE] [--write-loadorder FILE] [--groups] [--sources] [--all] [--brief] [--full-order] [--no-overlap] [--no-groups] [--json]
 Effective order with load indices (`00`, `FE:001`), flags, new/override counts, then problems and
 suggested moves with reasons. Codes (level):
 
 | code | level | meaning |
 |---|---|---|
-| `missing-master`, `inactive-master` | error | game crashes on start (skipped for Bash `Filter` patches) |
+| `missing-master`, `inactive-master` | error | game crashes on start (skipped for Bash `Filter` patches); a ghosted master counts as missing |
+| `master-cycle` | error | plugins list each other as masters |
 | `master-order` | error | plugin loads before its master |
 | `master-needs-nonmaster` | error | master-flagged plugin depends on a regular plugin (game hoists it; LOOT cannot sort) |
 | `esl-range` | error | light plugin with new records outside its range (breaks saves) |
 | `too-many-plugins`, `too-many-light` | error | above 254 (255 without lights) full / 4096 light plugins |
 | `needs-bees` | error | header 1.71 plugins on a game older than 1.6.1130 without BEES |
+| `vr-no-esl` | error | Skyrim VR with light plugins but without Skyrim VR ESL Support |
+| `hedr-low-range` | warning | a pre-1.71 plugin overrides object IDs below 0x800 of a header-1.71 master |
+| `loot-cannot-sort` | warning | LOOT req/after metadata makes a master load after a regular plugin (LOOT stops sorting) |
+| `loot-metadata` | warning | the masterlist or userlist could not be read (the other one is still used) |
+| `ghosted` | warning | active in plugins.txt but only `Name.esp.ghost` exists (the game does not load it) |
 | `loot-requires`, `loot-incompatible`, `undefined-group` | error | LOOT masterlist/userlist rules |
 | `loot-message`, `loot-global` | per message | LOOT masterlist messages whose conditions hold |
 | `dirty` | warning | CRC matches a LOOT dirty entry (ITM/UDR/deleted navmesh counts) |
@@ -212,7 +218,12 @@ suggested moves with reasons. Codes (level):
 
 `--rules` JSON: `{"Plugin.esp": {"after": ["Other.esp"], "before": ["X.esp"]}}` (hard rules, like
 LOOT userlist `after`). `--write` writes the suggested order as a Windows-1252 plugins.txt
-(hardcoded/CC plugins left out, inactive and missing entries kept next to their neighbours).
+(hardcoded/CC plugins left out, inactive and missing entries kept next to their neighbours);
+`--write-loadorder` also writes it as a loadorder.txt (every plugin, UTF-8). MO2 takes its order
+from the profile's loadorder.txt, so write both for an MO2 profile (with MO2 closed). For MO2
+profiles the shown order is read from loadorder.txt (with plugins.txt's active flags), as MO2
+does. Installed plugins missing from plugins.txt are treated as inactive. `--no-groups` drops only
+LOOT groups; LOOT load-after/requirement rules still apply.
 `--groups` shows LOOT groups, `--sources` the MO2 mod each plugin comes from.
 
 ### scan [options] [--deep] [--max-deep N] [--only PLUGIN] [-t TYPE] [--details] [--limit N] [--limit-records N] [--json]

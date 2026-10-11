@@ -223,7 +223,9 @@ class Scanner:
             c.overriders = overriders
             w = c.winner.entry
             mc = self.masters_closure(w)
-            c.patched = all(v.entry is w or v.entry.low in mc for v in overriders)
+            # a generated patch (Bashed/Smashed/Synthesis) is built from everything
+            # loaded before it, whether or not it lists those plugins as masters
+            c.patched = self.model.is_generated(w) or all(v.entry is w or v.entry.low in mc for v in overriders)
             out.append(c)
         out.sort(key=lambda c: (SEVERITY_RANK[CATEGORY_INFO.get(c.category, ('', 'low'))[1]], c.sig, c.key))
         return out
@@ -245,6 +247,8 @@ class Scanner:
         out = {}
         for c in conflicts:
             w = c.winner.entry
+            if self.model.is_generated(w):
+                continue            # generated patches include what loaded before them
             mc = self.masters_closure(w)
             for v in c.overriders:
                 e = v.entry
@@ -273,6 +277,7 @@ class Scanner:
         """Cells that receive NAVM records from two or more non-official plugins
         (even when the NAVM FormIDs differ)."""
         cells = {}
+        navs = {}
         for e in self.order:
             s = e.scan
             if s is None or e.implicit or not s.navm_cells:
@@ -280,19 +285,24 @@ class Scanner:
             ids = [self.owner_id(m) for m in s.masters] + [self.owner_id(s.name)]
             for navm, cell in s.navm_cells.items():
                 idx = cell >> 24
-                if idx >= len(ids):
+                if idx >= len(ids) or (navm >> 24) >= len(ids):
                     continue
                 key = (ids[idx] << 24) | (cell & 0xFFFFFF)
                 cells.setdefault(key, []).append(e)
+                navs.setdefault(key, set()).add((ids[navm >> 24] << 24) | (navm & 0xFFFFFF))
         out = []
         for key, ents in cells.items():
             uniq = []
             for e in ents:
                 if e not in uniq:
                     uniq.append(e)
-            if len(uniq) >= 2:
-                owner, obj = self.key_owner(key)
-                out.append((f'{obj:06X}:{owner}', uniq))
+            if len(uniq) < 2 or len(navs[key]) < 2:
+                continue        # one plugin, or one navmesh record (reported as a record conflict)
+            last = uniq[-1]
+            if all(e.low in self.masters_closure(last) for e in uniq[:-1]):
+                continue        # a navmesh patch built on all of them loads last
+            owner, obj = self.key_owner(key)
+            out.append((f'{obj:06X}:{owner}', uniq))
         return out
 
     def edid_duplicates(self, include_official=True):
@@ -337,17 +347,15 @@ class Scanner:
                 if v.entry not in [x.entry for x in ents]:
                     ents.append(v)
             injections.append((f'{obj:06X}:{owner}', ents))
-            # several plugins injecting the same id without depending on each other
-            for i, a in enumerate(ents):
-                for b in ents[i + 1:]:
-                    if a.entry.low not in self.masters_closure(b.entry) and \
-                            b.entry.low not in self.masters_closure(a.entry):
-                        collisions.append((f'{obj:06X}:{owner}', [x.entry.name for x in ents],
-                                           sorted({x.sig for x in ents})))
-                        break
-                else:
-                    continue
-                break
+            # originators: versions that do not build on another plugin injecting the same id
+            names = {x.entry.low for x in ents}
+            origin = [x for x in ents if not (names - {x.entry.low}) & self.masters_closure(x.entry)]
+            clash = any(a.entry.low not in self.masters_closure(b.entry) and
+                        b.entry.low not in self.masters_closure(a.entry)
+                        for i, a in enumerate(origin) for b in origin[i + 1:])
+            if clash:
+                collisions.append((f'{obj:06X}:{owner}', [x.entry.name for x in origin],
+                                   sorted({x.sig for x in origin})))
         return injections, collisions
 
     def official_reverts(self):
@@ -373,6 +381,8 @@ class Scanner:
                     if f.entry.name not in d['fixers']:
                         d['fixers'].append(f.entry.name)
                 d['keys'].append(key)
+        for d in out.values():
+            d['fixers'].sort(key=lambda n: self.pos[n.lower()])
         return out
 
 
@@ -475,6 +485,14 @@ class DeepComparer:
         win, wflags = self.fields(c.winner)
         if win is None:
             return {'status': 'unknown', 'losers': [], 'npc': None}
+        # the original (defining plugin's) version: a lost field is a real clash
+        # only if the winner's side changed it too
+        orig = None
+        for x in c.versions:
+            if x.entry.low == c.owner.lower():
+                orig, _ = self.fields(x)
+                break
+        orig = orig or {}
         losers = []
         all_same = True
         for v in c.overriders:
@@ -505,16 +523,19 @@ class DeepComparer:
                     continue
                 if wv == pv:
                     continue
+                ov = orig.get(sig, bv)
                 structs = _single_dicts(pv, bv, wv)
                 if structs is not None:
                     p, b, w = structs
+                    o = _single_dicts(pv, ov, wv)
+                    o = o[1] if o is not None else b
                     for k in p:
                         if k.startswith('_') or p.get(k) == b.get(k) or w.get(k) == p.get(k):
                             continue
-                        kind = 'reverted' if w.get(k) == b.get(k) else 'clash'
+                        kind = 'reverted' if w.get(k) in (b.get(k), o.get(k)) else 'clash'
                         lost.append((f'{sig}.{k}', kind, f'{b.get(k)!r} -> {p.get(k)!r}, winner has {w.get(k)!r}'))
                     continue
-                kind = 'reverted' if wv == bv else 'clash'
+                kind = 'reverted' if wv in (bv, ov) else 'clash'
                 lost.append((sig, kind, _value_detail(pv, bv, wv)))
             if fl != bflags and wflags == bflags:
                 lost.append(('@flags', 'reverted', 'record header flags'))

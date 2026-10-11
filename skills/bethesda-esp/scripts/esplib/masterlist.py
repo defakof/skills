@@ -178,18 +178,15 @@ class MiniYaml:
     scalars, comments and |/> block scalars. No anchors, aliases or tags."""
 
     def __init__(self, text):
-        self.lines = []
-        raw = text.splitlines()
-        i = 0
-        while i < len(raw):
-            line = raw[i]
-            i += 1
+        self.lines = []               # [indent, text without comment, index in self.raw]
+        self.raw = text.splitlines()
+        for i, line in enumerate(self.raw):
             stripped = line.strip()
             if not stripped or stripped.startswith('#') or stripped in ('---', '...'):
                 continue
             if '\t' in line[:len(line) - len(line.lstrip())]:
                 raise YamlError('tabs in indentation')
-            self.lines.append([len(line) - len(line.lstrip(' ')), _strip_comment(line.strip()), raw, i])
+            self.lines.append([len(line) - len(line.lstrip(' ')), _strip_comment(line.strip()), i])
         self.pos = 0
 
     def parse(self):
@@ -261,17 +258,43 @@ class MiniYaml:
 
     def _scalar_or_flow(self, text, indent):
         if text[:1] in '|>':
-            lines = []
-            while True:
-                nxt = self._peek()
-                if nxt is None or nxt[0] <= indent:
-                    break
-                lines.append(nxt[1])
-                self.pos += 1
-            return ('\n' if text[0] == '|' else ' ').join(lines) + ('\n' if lines and text[:2] != '|-' else '')
+            return self._block_scalar(text, indent)
         if text[:1] in '&*!':
             raise YamlError('anchors/aliases/tags need PyYAML (pip install pyyaml)')
-        return _flow(text)
+        if text[:1] in '[{':
+            return _flow(text)
+        if text[:1] in '\'"':
+            val, end = _quoted(text, 0)
+            if text[end:].strip():
+                raise YamlError(f'unexpected text after value: {text!r}')
+            return val
+        return _plain(text)                 # block plain scalar: the rest of the line
+
+    def _block_scalar(self, head, indent):
+        """| or > block: raw lines (comments and blank lines kept) indented
+        deeper than the key."""
+        start = self.lines[self.pos - 1][2] + 1 if self.pos else 0
+        body = []
+        j = start
+        while j < len(self.raw):
+            line = self.raw[j]
+            if line.strip() and len(line) - len(line.lstrip(' ')) <= indent:
+                break
+            body.append(line)
+            j += 1
+        while body and not body[-1].strip():
+            body.pop()
+        while self.pos < len(self.lines) and self.lines[self.pos][2] < j:
+            self.pos += 1
+        if not body:
+            return ''
+        cut = min(len(x) - len(x.lstrip(' ')) for x in body if x.strip())
+        body = [x[cut:] for x in body]
+        if head[0] == '|':
+            text = '\n'.join(body)
+        else:                               # folded: single newlines become spaces
+            text = re.sub(r'(?<!\n)\n(?!\n)', ' ', '\n'.join(body))
+        return text + ('' if head[1:2] == '-' else '\n')
 
 
 def _strip_comment(s):
@@ -280,8 +303,8 @@ def _strip_comment(s):
         if q:
             if ch == q:
                 q = None
-        elif ch in '\'"':
-            q = ch
+        elif ch in '\'"' and (i == 0 or s[i - 1] in ' \t[{,:'):
+            q = ch                  # a quote only opens a string at the start of a value
         elif ch == '#' and (i == 0 or s[i - 1] in ' \t'):
             return s[:i].rstrip()
     return s
@@ -833,13 +856,7 @@ class Metadata:
     def load(cls, masterlist=None, userlist=None):
         """masterlist: path (.yaml/.json/.json.gz), 'none', or None for the best
         available (updated cache, else bundled snapshot). userlist: path or None."""
-        ml = None
-        if masterlist != 'none':
-            path = masterlist or default_masterlist_path()
-            if path:
-                ml = load_yaml_metadata(path) if path.lower().endswith(('.yaml', '.yml')) else load_compact(path)
-        ul = load_yaml_metadata(userlist) if userlist else None
-        return cls(ml, ul)
+        return cls(load_masterlist_data(masterlist), load_yaml_metadata(userlist) if userlist else None)
 
     # -- groups ---------------------------------------------------------------
     def group_exists(self, g):
@@ -894,6 +911,17 @@ class Metadata:
     def known(self, name):
         low = name.lower()
         return low in self._exact or any(rx.fullmatch(name) for rx, _e, _s in self._regex)
+
+
+def load_masterlist_data(masterlist=None):
+    """Compact masterlist data from a path (.yaml/.json/.json.gz), None for
+    the best available copy, or 'none'."""
+    if masterlist == 'none':
+        return None
+    path = masterlist or default_masterlist_path()
+    if not path:
+        return None
+    return load_yaml_metadata(path) if path.lower().endswith(('.yaml', '.yml')) else load_compact(path)
 
 
 def evaluate_items(items, ev):
