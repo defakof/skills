@@ -7,7 +7,11 @@
 | `--data DIR` | game `Data` folder: where masters, `Strings/` and BSAs are looked up (the plugin's own folder is always searched) |
 | `--encoding ENC` | code page of non-localized text (default `cp1252`; e.g. `cp1251` for Russian, `utf-8`). Env: `ESP_ENCODING` |
 | `--lang NAME` | strings language for localized plugins (default `english` -> `Skyrim_english.STRINGS`) |
-| `--mo2 PROFILE_DIR` | Mod Organizer 2 profile folder: plugins, masters, strings and BSAs are found in its enabled mods by priority (Overwrite first), then the game's Data folder from ModOrganizer.ini - like the game sees them through MO2 |
+| `--mo2 PROFILE_DIR` (alias `--profile`) | Mod Organizer 2 profile folder: plugins, masters, strings and BSAs are found in its enabled mods by priority (Overwrite first), then the game's Data folder from ModOrganizer.ini - like the game sees them through MO2 |
+
+The command may also come after the plugin or the options: `esp MyMod.esp info` and
+`esp --mo2 P check-order` work like `esp info MyMod.esp` / `esp check-order --mo2 P`;
+`esp MyMod.esp` alone runs `info`.
 
 Commands that write also accept `-o OUT` (write a new file instead of in place),
 `--no-backup` (no `.bak` when writing in place) and `--dry-run`.
@@ -180,16 +184,27 @@ These commands share the load-order options:
 | option | meaning |
 |---|---|
 | `PLUGIN...` | plugin files or names in load order (instead of a plugins.txt; all treated as active) |
-| `--plugins-txt FILE` | the game's or a profile's plugins.txt (`*` = active) |
-| `--mo2 PROFILE_DIR` | MO2 profile folder: reads its plugins.txt/loadorder.txt/modlist.txt and ModOrganizer.ini (game path, mods folder); plugin files are found by mod priority |
-| `--data DIR` | game Data folder (also locates `Skyrim.ccc` and `SkyrimSE.exe` next to it) |
-| `--loadorder-txt FILE` | compared with plugins.txt (desync warning); used alone only if there is no plugins.txt |
+| `--plugins-txt FILE` (alias `--plugins`) | the game's or a profile's plugins.txt (`*` = active); one inside an MO2 profile folder (`<MO2>/profiles/<name>/plugins.txt`) works like `--mo2` on that folder |
+| `--mo2 PROFILE_DIR` (alias `--profile`) | MO2 profile folder: reads its plugins.txt/loadorder.txt/modlist.txt and ModOrganizer.ini (game path, mods folder); plugin files are found by mod priority |
+| `--data DIR` | game Data folder (also locates `Skyrim.ccc` and `SkyrimSE.exe` next to it). A plugins.txt only names plugins: without `--data` or `--mo2` the files cannot be found (error) |
+| `--loadorder-txt FILE` (alias `--loadorder`) | compared with plugins.txt (desync warning); used alone only if there is no plugins.txt |
 | `--mods DIR` / `--ccc FILE` | override the MO2 mods folder / Skyrim.ccc location |
-| `--masterlist FILE` / `--userlist FILE` / `--no-loot` | LOOT metadata: masterlist (`.yaml` needs PyYAML, or a `.json(.gz)` snapshot; default: the bundled or updated snapshot), userlist (default: LOOT's or Vortex's, found automatically), or none |
-| `--no-cache` | rescan every plugin (header scans are cached per file in `~/.cache/bethesda-esp/scan`) |
+| `--masterlist FILE` / `--userlist FILE` / `--no-loot` | not for `check-order`. LOOT metadata: masterlist (`.yaml` needs PyYAML, or a `.json(.gz)` snapshot; default: the bundled or updated snapshot), userlist (default: LOOT's or Vortex's, found automatically), or none |
+| `--no-cache` | not for `check-order`. Rescan every plugin (record-header scans are cached per file in `~/.cache/bethesda-esp/scan`) |
 
 Without `--plugins-txt`/`--mo2`, plugins.txt is looked for in `%LOCALAPPDATA%` (Steam/GOG/Epic/MS
 folder chosen from the game folder) and the Proton prefix.
+
+### check-order [options] [--list] [--sources] [--all] [--json]
+Fast check from plugin headers only (a few hundred bytes per plugin, well under a second for
+1000+ plugins, nothing cached): missing/ghosted/inactive masters, plugins loading before their
+masters, masters that need a regular plugin, master cycles, the 254/4096 limits, ESM/ESL flags
+and header versions (LE header, 1.71 vs game version/BEES), generated-patch placement, missing or
+duplicate entries. Exit code `1` when there are errors (`0` otherwise), so scripts can use it as a
+gate. Not checked (needs whole files): ESL object-ID ranges, new CELLs in light plugins, LE record
+formats, LOOT rules, sorting, conflicts - the output ends with the matching `esp loadorder`
+command. `--list` prints the effective order (index, flags, master count); `--json` gives
+`ok`, `counts`, `effective_order` (with each plugin's masters), `issues`, `full_check`.
 
 ### loadorder [options] [--rules FILE] [--write FILE] [--write-loadorder FILE] [--groups] [--sources] [--all] [--brief] [--full-order] [--no-overlap] [--no-groups] [--json]
 Effective order with load indices (`00`, `FE:001`), flags, new/override counts, then problems and
@@ -252,5 +267,5 @@ PyYAML (`pip install pyyaml`).
 ---
 
 ## Exit codes
-`0` ok, `1` usage, `2` error (message on stderr starting with `error:`). `delete` exits 2 when it
-refuses because of references.
+`0` ok; `1` no command given, or `check-order` found errors; `2` error or bad arguments (message on
+stderr, starting with `error:` for errors). `delete` exits 2 when it refuses because of references.

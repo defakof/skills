@@ -7,7 +7,7 @@ import json
 import os
 import re
 
-from .core import Plugin, EspError
+from .core import Plugin, EspError, FormKey
 from .codec import parse_formid_text, format_formid
 from .strings import StringTables, _ci_join
 
@@ -178,26 +178,16 @@ class LoadOrder:
     # -- FormKeys ------------------------------------------------------------
     @staticmethod
     def owner_of(plugin, fid):
-        idx = fid >> 24
-        ms = plugin.masters
-        if idx < len(ms):
-            return ms[idx]
-        if idx == len(ms):
-            return plugin.name
-        return None
+        return plugin.formid_owner(fid)
 
     def formkey(self, plugin, fid):
+        """FormKey (object ID, defining plugin); compares case-insensitively."""
         o = self.owner_of(plugin, fid)
-        return (fid & 0xFFFFFF, o) if o else None
+        return FormKey(fid, o) if o else None
 
     @staticmethod
     def local_fid(plugin, objid, owner):
-        names = [m.lower() for m in plugin.masters]
-        if owner.lower() == plugin.name.lower():
-            return (len(names) << 24) | objid
-        if owner.lower() in names:
-            return (names.index(owner.lower()) << 24) | objid
-        return None
+        return plugin.local_formid((objid, owner))
 
     def describe(self, plugin, fid, with_type=True):
         """'IronSword [WEAP:012EB7:Skyrim.esm]' style label for display."""

@@ -17,6 +17,7 @@ compatibility: Needs Python 3.8+ (no packages). Optional - .NET 10 SDK for the S
 - On Windows use `python` (or `py`) instead of `python3`.
 
 Below, **`esp`** stands for that full command. `esp <command> -h` shows every option.
+(`esp MyMod.esp info` works too: the command may follow the plugin.)
 
 Records can be named by **EditorID** (`IronSword`), **FormKey** (`012EB7:Skyrim.esm` - object id +
 the plugin that defines it; master-order independent, preferred) or **file-local FormID**
@@ -83,7 +84,9 @@ Missing subrecords are created in the right position (`esp set X Y XSCL=1.5`).
 
 For complex or bulk edits: `esp show F REC --json > rec.json`, edit the JSON, `esp put F rec.json`
 (same format; `"formid": "new"` adds a new record). `esp export F -t WEAP -o all.json` dumps many.
-For scripted bulk changes use the Python API (`references/python-api.md`).
+For scripted bulk changes use the Python API (`references/python-api.md`): `Plugin.load_header(path)`
+reads only masters/flags (milliseconds per plugin, for audits across a load order) and
+`record.formkey` identifies a record across plugins whatever their master lists.
 
 ## Make a patch (compatibility / tweak)
 
@@ -110,7 +113,9 @@ Plugins only (not BSA/loose-file priority). Give the load order as an MO2 profil
 `--plugins-txt` + `--data "<Skyrim>/Data"` (Steam: `%LOCALAPPDATA%\Skyrim Special Edition\Plugins.txt`).
 
 ```bash
-esp loadorder --mo2 "D:/MO2/profiles/Default" --groups     # errors, warnings, suggested moves (and why)
+esp check-order --mo2 "D:/MO2/profiles/Default"            # fast (headers only): missing/inactive masters,
+                                                           # master order, 254/4096 limits; exit 1 on errors
+esp loadorder --mo2 "D:/MO2/profiles/Default" --groups     # full check + LOOT rules, suggested moves (and why)
 esp loadorder ... --write plugins_sorted.txt               # suggested order as a plugins.txt (review first)
 esp scan ...                                               # every multi-mod conflict + prioritized fixes
 esp scan ... --deep [--details]                            # field-level: whose changes are lost, clashes

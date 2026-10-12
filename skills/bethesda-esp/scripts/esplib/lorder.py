@@ -12,7 +12,7 @@ import re
 import struct
 
 from .core import EspError
-from .scan import scan_file
+from .scan import scan_file, scan_header
 from . import masterlist as mlist
 
 # Always loaded first, in this order, when present (the game forces them).
@@ -273,6 +273,13 @@ def mo2_dirs(profile_dir, mods_dir=None):
     return game, dirs
 
 
+def is_mo2_profile(folder):
+    """An MO2 profile folder: <MO2>/profiles/<name> with plugins.txt and modlist.txt."""
+    return (os.path.isfile(os.path.join(folder, 'modlist.txt'))
+            and os.path.isfile(os.path.join(folder, 'plugins.txt'))
+            and os.path.basename(os.path.dirname(os.path.abspath(folder))).lower() == 'profiles')
+
+
 def _ver_str(v):
     return '.'.join(str(x) for x in v) if v else '?'
 
@@ -343,12 +350,16 @@ class LoadOrderModel:
         self.meta = None           # masterlist.Metadata (LOOT masterlist + userlist)
         self.meta_error = None
         self._ev = None
+        self.header_only = False   # scanned with scan_header(): no record-level data
 
     # -- construction ------------------------------------------------------
     @classmethod
     def from_sources(cls, plugins=None, data=None, plugins_txt=None, loadorder_txt=None,
                      mo2_profile=None, mods_dir=None, ccc=None, scan=True, use_cache=True,
-                     auto=True, masterlist=None, userlist=None, use_metadata=True):
+                     auto=True, masterlist=None, userlist=None, use_metadata=True, header_only=False):
+        """header_only=True reads just each plugin's header (masters, flags,
+        versions): enough for master/order/limit checks, not for record-level
+        ones (ESL ranges, overlap sorting, conflicts)."""
         lo = cls()
         listed = []          # [(name, active)]
         for what, path, isdir in (('Data folder', data, True), ('plugins.txt', plugins_txt, False),
@@ -356,6 +367,12 @@ class LoadOrderModel:
                                   ('MO2 mods folder', mods_dir, True), ('Skyrim.ccc', ccc, False)):
             if path and not (os.path.isdir(path) if isdir else os.path.isfile(path)):
                 raise EspError(f'{what} not found: {path}')
+        if not mo2_profile and not plugins:
+            # a plugins.txt/loadorder.txt inside an MO2 profile: its plugins live in the mod folders
+            for txt in (plugins_txt, loadorder_txt):
+                if txt and is_mo2_profile(os.path.dirname(os.path.abspath(txt))):
+                    mo2_profile = os.path.dirname(os.path.abspath(txt))
+                    break
         if mo2_profile:
             prof = os.path.abspath(mo2_profile)
             if not os.path.isfile(os.path.join(prof, 'plugins.txt')) and not plugins_txt:
@@ -458,8 +475,11 @@ class LoadOrderModel:
         lo._build_entries(listed, explicit)
         if not plugins and (plugins_txt or lo.data_dir):
             lo._find_unlisted()
+        if not lo.search_dirs and not explicit:
+            raise EspError('cannot find the plugin files: pass --data "<Skyrim>/Data" or --mo2 "<MO2>/profiles/<name>" '
+                           '(a plugins.txt only lists names)')
         if scan:
-            lo.scan_all(use_cache)
+            lo.scan_all(use_cache, header_only=header_only)
         if use_metadata and not (masterlist == 'none' and not userlist):
             lo.load_metadata(masterlist, userlist)
         return lo
@@ -606,11 +626,12 @@ class LoadOrderModel:
         for n, label, path in sorted(found.values(), key=lambda t: t[0].lower()):
             self.entries.append(Entry(n, path, False, None, None, label))   # installed, inactive
 
-    def scan_all(self, use_cache=True):
+    def scan_all(self, use_cache=True, header_only=False):
+        self.header_only = header_only
         for e in self.entries:
             if e.path and (e.active or e.implicit):
                 try:
-                    e.scan = scan_file(e.path, use_cache)
+                    e.scan = scan_header(e.path) if header_only else scan_file(e.path, use_cache)
                 except (EspError, OSError, struct.error, IndexError, ValueError) as ex:
                     e.scan_error = str(ex) or type(ex).__name__
 

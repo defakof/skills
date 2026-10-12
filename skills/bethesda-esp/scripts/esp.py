@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -1127,6 +1128,98 @@ def _meta_desc(model):
     return '; '.join(model.meta.sources)
 
 
+def _lo_source_args(args, model):
+    """The load-order source options of this run, to repeat in a suggested command."""
+    def q(v):
+        return f'"{v}"'
+    out = []
+    if model.mo2_profile:
+        out.append(f'--mo2 {q(model.mo2_profile)}')
+    if args.data:
+        out.append(f'--data {q(os.path.abspath(args.data))}')
+    elif model.data_dir and not model.mo2_profile:
+        out.append(f'--data {q(model.data_dir)}')
+    for opt, val in (('--plugins-txt', args.plugins_txt), ('--loadorder-txt', args.loadorder_txt)):
+        if val and not (model.mo2_profile and os.path.dirname(os.path.abspath(val)) == model.mo2_profile):
+            out.append(f'{opt} {q(os.path.abspath(val))}')
+    for opt, val in (('--mods', args.mods), ('--ccc', args.ccc)):
+        if val:
+            out.append(f'{opt} {q(os.path.abspath(val))}')
+    out += [q(x) if ' ' in x else x for x in (args.plugins or [])]
+    return ' '.join(out)
+
+
+NOT_CHECKED_HEADER_ONLY = ('ESL object-ID ranges and new CELLs in light plugins, Skyrim LE record formats, '
+                           'LOOT masterlist/userlist rules, sorting, and record conflicts')
+
+
+def cmd_check_order(args):
+    t0 = time.perf_counter()
+    model = lorder.LoadOrderModel.from_sources(
+        plugins=args.plugins or None, data=args.data, plugins_txt=args.plugins_txt,
+        loadorder_txt=args.loadorder_txt, mo2_profile=args.mo2, mods_dir=args.mods, ccc=args.ccc,
+        header_only=True, use_metadata=False)
+    issues = model.validate()
+    secs = time.perf_counter() - t0
+    order = model.effective_order()
+    idx = model.load_indices(order)
+    n_light = sum(1 for e in order if model.is_light(e))
+    n_full = len(order) - n_light
+    max_full = model.max_full(order)
+    inactive = [e for e in model.entries if not e.active and not e.implicit]
+    errs = [i for i in issues if i.level == 'error']
+    warns = [i for i in issues if i.level == 'warning']
+    full_cmd = 'esp loadorder ' + _lo_source_args(args, model)
+    for i in issues:
+        if i.fix and '(see the suggested order)' in i.fix:
+            i.fix = i.fix.replace('(see the suggested order)', '(esp loadorder suggests a whole order)')
+    if args.json:
+        say(dumps({
+            'source': model.source_desc,
+            'manager': model.manager,
+            'game_version': '.'.join(map(str, model.game_version)) if model.game_version else None,
+            'checked': 'plugin headers only',
+            'seconds': round(secs, 3),
+            'ok': not errs,
+            'counts': {'active': len(order), 'full': n_full, 'full_limit': max_full, 'light': n_light,
+                       'light_limit': 4096, 'inactive': len(inactive), 'unlisted': len(model.unlisted)},
+            'effective_order': [{'index': idx[e.low], 'name': e.name, 'flags': _flags_str(e),
+                                 'implicit': e.implicit, 'listed': e.listed, 'source': e.source,
+                                 'masters': e.scan.masters if e.scan else [],
+                                 'header_version': round(e.scan.hedr_version, 2) if e.scan else None}
+                                for e in order],
+            'issues': [i.as_dict() for i in issues],
+            'not_checked': NOT_CHECKED_HEADER_ONLY,
+            'full_check': full_cmd,
+        }))
+        return 1 if errs else 0
+    say(f'Load order from {model.source_desc}' + (f' ({model.manager})' if model.manager else ''))
+    if model.game_version:
+        say(f'  game: SkyrimSE.exe {".".join(map(str, model.game_version))}')
+    say(f'  {len(order)} active plugins: {n_full} full (of {max_full} slots), {n_light} light (FE, of 4096), '
+        f'{len(inactive)} inactive')
+    say(f'  checked {sum(1 for e in order if e.scan)} plugin headers in {secs:.2f} s: masters installed, active and '
+        'loading first; ESM/ESL flags; plugin limits; header versions')
+    if args.list:
+        say('')
+        say('  idx    flags     masters  plugin')
+        for e in order:
+            tag = f'  [{e.implicit}]' if e.implicit else ''
+            srcl = f'  <{e.source}>' if args.sources and e.source else ''
+            say(f'  {idx[e.low]:<6} {_flags_str(e):<8} {len(e.scan.masters) if e.scan else "-":>8}  {e.name}{tag}{srcl}')
+    say('')
+    say(f'Problems: {len(errs)} error(s), {len(warns)} warning(s), '
+        f'{sum(1 for i in issues if i.level == "info")} note(s)')
+    _print_issues(issues, include_info=args.all)
+    say('')
+    if errs:
+        say(f'FAILED: {len(errs)} error(s) - the game will crash or misbehave until they are fixed.')
+    else:
+        say('OK: no errors' + (f' ({len(warns)} warning(s) above)' if warns else '') + '.')
+    say(f'Not checked from headers: {NOT_CHECKED_HEADER_ONLY}. For those (and a suggested order) run: {full_cmd}')
+    return 1 if errs else 0
+
+
 def cmd_loadorder(args):
     model = load_model(args)
     issues = model.validate()
@@ -1426,13 +1519,16 @@ def build_parser():
                '  esp.py show MyMod.esp IronSword\n'
                '  esp.py set MyMod.esp IronSword DATA.damage=12 "FULL=Sharp Iron Sword"\n'
                '  esp.py copy ModA.esp 012EB7:Skyrim.esm --to Patch.esp --create\n'
-               '  esp.py conflicts ModA.esp ModB.esp --details\n')
+               '  esp.py conflicts ModA.esp ModB.esp --details\n'
+               '  esp.py check-order --mo2 "D:/MO2/profiles/Default"\n'
+               'The command may also follow the plugin (esp.py MyMod.esp info).\n')
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument('--data', help='game Data folder (to find masters, strings, BSAs)')
     common.add_argument('--encoding', help='text encoding of plugin strings (default cp1252)')
     common.add_argument('--lang', default='english', help='strings language (default english)')
-    common.add_argument('--mo2', help='Mod Organizer 2 profile folder: find plugins, masters, strings and BSAs '
-                        'in its enabled mods (by priority) as the game sees them')
+    common.add_argument('--mo2', '--profile', dest='mo2',
+                        help='Mod Organizer 2 profile folder (<MO2>/profiles/<name>): find plugins, masters, strings '
+                        'and BSAs in its enabled mods (by priority) as the game sees them')
     write = argparse.ArgumentParser(add_help=False)
     write.add_argument('-o', '--output', help='write to this file instead of in place')
     write.add_argument('--no-backup', action='store_true', help='do not keep a .bak when writing in place')
@@ -1608,17 +1704,35 @@ def build_parser():
     sp.add_argument('--search')
     sp.add_argument('--limit', type=int, default=50)
 
-    lo_src = argparse.ArgumentParser(add_help=False)
-    lo_src.add_argument('plugins', nargs='*', help='plugin files/names in load order (instead of a plugins.txt)')
-    lo_src.add_argument('--plugins-txt', help='plugins.txt (Steam: %%LOCALAPPDATA%%\\Skyrim Special Edition\\plugins.txt)')
-    lo_src.add_argument('--loadorder-txt', help='loadorder.txt with the full order (LOOT / MO2 / Wrye Bash)')
-    lo_src.add_argument('--mods', help='MO2 mods folder (default: from ModOrganizer.ini)')
-    lo_src.add_argument('--ccc', help='Skyrim.ccc (default: next to the Data folder)')
+    lo_base = argparse.ArgumentParser(add_help=False)
+    lo_base.add_argument('plugins', nargs='*', help='plugin files/names in load order (instead of a plugins.txt)')
+    lo_base.add_argument('--plugins-txt', '--plugins', dest='plugins_txt',
+                         help='plugins.txt (Steam: %%LOCALAPPDATA%%\\Skyrim Special Edition\\plugins.txt; '
+                              'one inside an MO2 profile folder works like --mo2)')
+    lo_base.add_argument('--loadorder-txt', '--loadorder', dest='loadorder_txt',
+                         help='loadorder.txt with the full order (LOOT / MO2 / Wrye Bash)')
+    lo_base.add_argument('--mods', help='MO2 mods folder (default: from ModOrganizer.ini)')
+    lo_base.add_argument('--ccc', help='Skyrim.ccc (default: next to the Data folder)')
+    lo_src = argparse.ArgumentParser(add_help=False, parents=[lo_base])
     lo_src.add_argument('--no-cache', action='store_true', help='rescan every plugin (ignore the scan cache)')
     lo_src.add_argument('--masterlist', help='LOOT masterlist (.yaml needs PyYAML, or a json(.gz) snapshot); '
                         '"none" to skip LOOT data. Default: bundled snapshot or the one from esp loot-update')
     lo_src.add_argument('--userlist', help='LOOT/Vortex userlist.yaml (default: found automatically)')
     lo_src.add_argument('--no-loot', action='store_true', help='ignore LOOT masterlist/userlist metadata')
+
+    sp = add('check-order', cmd_check_order, 'fast load order check from plugin headers only: missing or inactive '
+             'masters, masters loading after their dependents, 254/4096 plugin limits, flags, header versions '
+             '(exit code 1 when there are errors)', parents=[lo_base],
+             epilog='Examples:\n'
+                    '  esp check-order --mo2 "D:/MO2/profiles/Default"\n'
+                    '  esp check-order --plugins "D:/MO2/profiles/Default/plugins.txt"   (MO2 profile found from it)\n'
+                    '  esp check-order --data "D:/Skyrim Special Edition/Data" --plugins-txt "%LOCALAPPDATA%/Skyrim Special Edition/plugins.txt"\n'
+                    'Reads a few hundred bytes per plugin. esp loadorder does the full check (ESL ranges, LOOT rules) '
+                    'and suggests an order.')
+    sp.add_argument('--list', action='store_true', help='print the effective load order (index, flags, masters)')
+    sp.add_argument('--sources', action='store_true', help='with --list: show the MO2 mod / folder of each plugin')
+    sp.add_argument('--all', action='store_true', help='also print notes (info-level findings)')
+    sp.add_argument('--json', action='store_true')
 
     sp = add('loadorder', cmd_loadorder, 'check a load order (masters, flags, limits) and suggest a fixed order',
              parents=[lo_src],
@@ -1670,6 +1784,40 @@ def build_parser():
     return ap
 
 
+PLUGIN_EXTS = ('.esp', '.esm', '.esl', '.esp.ghost', '.esm.ghost', '.esl.ghost')
+
+
+def _command_names(ap):
+    for a in ap._actions:
+        if isinstance(a, argparse._SubParsersAction):
+            return a.choices
+    return {}
+
+
+def normalize_argv(argv, commands):
+    """Accept the command anywhere before its own arguments: `esp X.esp info`
+    and `esp --data D info X.esp` mean `esp info X.esp` / `esp info X.esp --data D`.
+    A lone plugin file (`esp X.esp`) means `esp info X.esp`."""
+    argv = list(argv)
+    value_opts = {o for sp in commands.values() for a in sp._actions
+                  if a.option_strings and a.nargs != 0 for o in a.option_strings}
+    if not argv or argv[0] in commands or argv[0] in ('-h', '--help'):
+        return argv
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in commands:
+            return [tok] + argv[:i] + argv[i + 1:]
+        if tok in value_opts:
+            i += 2
+            continue
+        i += 1
+    pos = [t for t in argv if not t.startswith('-')]
+    if len(pos) == 1 and pos[0].lower().endswith(PLUGIN_EXTS) and 'info' in commands:
+        return ['info'] + argv
+    return argv
+
+
 def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -1677,6 +1825,7 @@ def main(argv=None):
         except (AttributeError, ValueError):
             pass
     ap = build_parser()
+    argv = normalize_argv(sys.argv[1:] if argv is None else argv, _command_names(ap))
     args, extra = ap.parse_known_args(argv)
     if extra:
         # older argparse cannot mix positionals after options (add ... --edid X FIELD=Y)
@@ -1690,13 +1839,13 @@ def main(argv=None):
         ap.print_help()
         return 1
     try:
-        args.fn(args)
+        rc = args.fn(args)
     except EspError as e:
         print(f'error: {e}', file=sys.stderr)
         return 2
     except BrokenPipeError:
         return 0
-    return 0
+    return rc if isinstance(rc, int) else 0
 
 
 if __name__ == '__main__':
