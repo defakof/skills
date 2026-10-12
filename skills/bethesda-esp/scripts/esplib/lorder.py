@@ -273,6 +273,19 @@ def mo2_dirs(profile_dir, mods_dir=None):
     return game, dirs
 
 
+def _check_list_file(what, path):
+    """Refuse a plugin file or a file without plugin lines given as plugins.txt/loadorder.txt."""
+    with open(path, 'rb') as f:
+        head = f.read(4)
+    if head == b'TES4':
+        raise EspError(f'{path} is a plugin, not a {what[2:].replace("-txt", ".txt")}: to check a list of plugin '
+                       'files, give them without an option')
+    lines = _read_lines(path)
+    if lines and not any(is_plugin_name(ln.lstrip('*').strip()) for ln in lines):
+        raise EspError(f'{path} does not look like a {what[2:].replace("-txt", ".txt")}: none of its lines is a '
+                       'plugin name (.esp/.esm/.esl)')
+
+
 def is_mo2_profile(folder):
     """An MO2 profile folder: <MO2>/profiles/<name> with plugins.txt and modlist.txt."""
     return (os.path.isfile(os.path.join(folder, 'modlist.txt'))
@@ -351,6 +364,7 @@ class LoadOrderModel:
         self.meta_error = None
         self._ev = None
         self.header_only = False   # scanned with scan_header(): no record-level data
+        self.order_unknown = False # no plugins.txt: plugins listed alphabetically
 
     # -- construction ------------------------------------------------------
     @classmethod
@@ -367,11 +381,17 @@ class LoadOrderModel:
                                   ('MO2 mods folder', mods_dir, True), ('Skyrim.ccc', ccc, False)):
             if path and not (os.path.isdir(path) if isdir else os.path.isfile(path)):
                 raise EspError(f'{what} not found: {path}')
+        for what, txt in (('--plugins-txt', plugins_txt), ('--loadorder-txt', loadorder_txt)):
+            if txt:
+                _check_list_file(what, txt)
+        if plugins and (plugins_txt or loadorder_txt):
+            raise EspError('give the load order either as plugin files or as a plugins.txt/loadorder.txt, not both')
         if not mo2_profile and not plugins:
-            # a plugins.txt/loadorder.txt inside an MO2 profile: its plugins live in the mod folders
-            for txt in (plugins_txt, loadorder_txt):
-                if txt and is_mo2_profile(os.path.dirname(os.path.abspath(txt))):
-                    mo2_profile = os.path.dirname(os.path.abspath(txt))
+            # a profile's own plugins.txt/loadorder.txt: its plugins live in the MO2 mod folders
+            for txt, base in ((plugins_txt, 'plugins.txt'), (loadorder_txt, 'loadorder.txt')):
+                folder = os.path.dirname(os.path.abspath(txt)) if txt else None
+                if folder and os.path.basename(txt).lower() == base and is_mo2_profile(folder):
+                    mo2_profile = folder
                     break
         if mo2_profile:
             prof = os.path.abspath(mo2_profile)
@@ -428,6 +448,13 @@ class LoadOrderModel:
             if plugins_txt:
                 listed = read_plugins_txt(plugins_txt)
                 lo.source_desc = lo.source_desc or f'plugins.txt {plugins_txt}'
+                if listed and not any(a for _n, a in listed):
+                    lo.issues.append(Issue('warning', 'no-active-plugins', None,
+                                           f'{plugins_txt} lists {len(listed)} plugin(s) but marks none active with '
+                                           '"*", so the game would load only the base game and Creation Club '
+                                           'plugins. Is this the right file?',
+                                           'Pass the Skyrim SE plugins.txt (%LOCALAPPDATA%\\Skyrim Special Edition) '
+                                           'or the MO2 profile\'s plugins.txt.'))
                 if lo.manager is None and 'vortex' in _read_text(plugins_txt)[:300].lower():
                     lo.manager = 'Vortex'
                 if loadorder_txt and os.path.isfile(loadorder_txt):
@@ -451,6 +478,7 @@ class LoadOrderModel:
                                        'All listed plugins are treated as active.',
                                        'Pass --plugins-txt as well.'))
             elif lo.data_dir:
+                lo.order_unknown = True
                 names = sorted(n for n in os.listdir(lo.data_dir) if is_plugin_name(n))
                 listed = [(n[:-6] if n.lower().endswith('.ghost') else n, not n.lower().endswith('.ghost'))
                           for n in names]
@@ -476,6 +504,12 @@ class LoadOrderModel:
         if not plugins and (plugins_txt or lo.data_dir):
             lo._find_unlisted()
         if not lo.search_dirs and not explicit:
+            if lo.mo2_profile:
+                ini = os.path.abspath(os.path.join(lo.mo2_profile, '..', '..', 'ModOrganizer.ini'))
+                _g, mods, _o = _mo2_ini_paths(lo.mo2_profile)
+                raise EspError(f'MO2 profile {lo.mo2_profile}: found neither the game (gamePath in {ini}) nor the mods '
+                               f'folder ({mods}); pass --data "<Skyrim>/Data" and, if the mods live elsewhere, '
+                               '--mods "<MO2>/mods"')
             raise EspError('cannot find the plugin files: pass --data "<Skyrim>/Data" or --mo2 "<MO2>/profiles/<name>" '
                            '(a plugins.txt only lists names)')
         if scan:
@@ -860,6 +894,11 @@ class LoadOrderModel:
                                             f'{e.name} requires {m}, which is ghosted ({os.path.basename(me.ghost)}) '
                                             'so the game cannot see it (crash on start)',
                                             f'Un-ghost and activate {m}, or disable {e.name}.', [m]))
+                        continue
+                    if me is None and self.find_path(m)[0]:
+                        issues.append(Issue('error', 'inactive-master', e.name,
+                                            f'{e.name} requires {m}, which is installed but not in the load order '
+                                            '(crash on start)', f'Add and activate {m}, or disable {e.name}.', [m]))
                         continue
                     issues.append(Issue('error', 'missing-master', e.name,
                                         f'{e.name} requires {m}, which is not installed (the game will crash on start)',

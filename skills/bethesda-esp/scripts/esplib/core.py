@@ -105,8 +105,9 @@ class FormKey(tuple):
     FormIDs in a plugin file are file-local - the top byte indexes that
     plugin's own master list - so the same record is 0x01012EB7 in one patch
     and 0x05012EB7 in another. FormKeys compare equal across plugins (plugin
-    names case-insensitively) and work as dict/set keys. str() gives the
-    CLI notation '012EB7:Skyrim.esm'; FormKey.parse() reads it back."""
+    names case-insensitively) and work as dict/set keys. They compare equal
+    only to other FormKeys: wrap a plain (id, name) pair with FormKey(*pair).
+    str() gives the CLI notation '012EB7:Skyrim.esm'; FormKey.parse() reads it back."""
 
     __slots__ = ()
 
@@ -118,8 +119,11 @@ class FormKey(tuple):
         """'012EB7:Skyrim.esm' or 'Skyrim.esm:012EB7'."""
         s = str(text).strip()
         a, sep, b = s.partition(':')
-        for oid, name in ((a, b), (b, a)):
+        for oid, name in ((a.strip(), b), (b.strip(), a)):
             if sep and oid and '.' in name and all(c in '0123456789abcdefABCDEF' for c in oid):
+                if int(oid, 16) > 0xFFFFFF:
+                    raise EspError(f'object ID too large in {s!r}: a FormKey has 6 hex digits (012EB7:Skyrim.esm), '
+                                   'without the load-order byte')
                 return cls(int(oid, 16), name.strip())
         raise EspError(f'not a FormKey: {s!r} (expected 012EB7:Skyrim.esm)')
 
@@ -131,17 +135,32 @@ class FormKey(tuple):
     def plugin(self):
         return self[1]
 
+    def _key(self):
+        return self[0], self[1].lower()
+
     def __eq__(self, other):
-        if isinstance(other, tuple) and len(other) == 2 and isinstance(other[1], str):
-            return self[0] == other[0] and self[1].lower() == other[1].lower()
-        return NotImplemented
+        if isinstance(other, FormKey):
+            return self._key() == other._key()
+        return False if isinstance(other, tuple) else NotImplemented
 
     def __ne__(self, other):
         eq = self.__eq__(other)
         return eq if eq is NotImplemented else not eq
 
+    def __lt__(self, other):
+        return self._key() < other._key() if isinstance(other, FormKey) else NotImplemented
+
+    def __le__(self, other):
+        return self._key() <= other._key() if isinstance(other, FormKey) else NotImplemented
+
+    def __gt__(self, other):
+        return self._key() > other._key() if isinstance(other, FormKey) else NotImplemented
+
+    def __ge__(self, other):
+        return self._key() >= other._key() if isinstance(other, FormKey) else NotImplemented
+
     def __hash__(self):
-        return hash((self[0], self[1].lower()))
+        return hash(self._key())
 
     def __getnewargs__(self):          # pickle / copy
         return (self[0], self[1])
@@ -302,6 +321,8 @@ class Record:
             self.subrecords  # noqa: B018 - force parse
         self._raw = None
         self._edid = False
+        if self.sig == 'TES4' and self.plugin is not None:
+            self.plugin._mcache = None          # the master list may have changed
 
     @property
     def is_modified(self):
@@ -391,7 +412,7 @@ class Record:
     @property
     def is_override(self):
         """True when the record comes from a master (it overrides it)."""
-        return (self.formid >> 24) < len(self._owning_plugin(None).masters)
+        return (self.formid >> 24) < len(self._owning_plugin(None)._master_list())
 
     def label(self):
         e = None
@@ -592,6 +613,7 @@ class Plugin:
         self._mcache = None
 
     def _no_records(self, what):
+        self.header              # noqa: B018 - raises for Plugin(name) without a header
         if self.header_only:
             raise EspError(f'{self.name} was loaded with Plugin.load_header(), which reads only the header: '
                            f'use Plugin.load(path) to {what}')
@@ -828,6 +850,8 @@ class Plugin:
         if isinstance(key, str):
             key = FormKey.parse(key)
         objid, owner = key
+        if not 0 <= objid <= 0xFFFFFF:
+            raise EspError(f'object ID {objid:#x} is out of range: a FormKey has a 6-digit object ID')
         owner = owner.lower()
         if owner == self.name.lower():
             return (len(self._master_list()) << 24) | (objid & 0xFFFFFF)
@@ -873,18 +897,20 @@ class Plugin:
 
     def index(self):
         if self._index is None:
-            self._index = {}
+            idx = {}
             for r in self.records():
-                self._index.setdefault(r.formid, r)
+                idx.setdefault(r.formid, r)
+            self._index = idx
         return self._index
 
     def edid_index(self):
         if self._edid_index is None:
-            self._edid_index = {}
+            idx = {}
             for r in self.records():
                 e = r.edid
                 if e:
-                    self._edid_index.setdefault(e.lower(), r)
+                    idx.setdefault(e.lower(), r)
+            self._edid_index = idx
         return self._edid_index
 
     def invalidate(self, structure=True):
@@ -897,6 +923,7 @@ class Plugin:
     def find(self, formid):
         """Record by FormID as stored in this plugin, or by FormKey (a record
         from another plugin: plugin.find(other_record.formkey))."""
+        self._no_records('look up its records')
         if isinstance(formid, (tuple, str)):
             formid = self.local_formid(formid)
             if formid is None:
@@ -904,6 +931,7 @@ class Plugin:
         return self.index().get(formid)
 
     def find_edid(self, edid):
+        self._no_records('look up its records')
         return self.edid_index().get(edid.lower())
 
     # -- structure edits ---------------------------------------------------

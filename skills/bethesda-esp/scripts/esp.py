@@ -1139,18 +1139,23 @@ def _lo_source_args(args, model):
         out.append(f'--data {q(os.path.abspath(args.data))}')
     elif model.data_dir and not model.mo2_profile:
         out.append(f'--data {q(model.data_dir)}')
-    for opt, val in (('--plugins-txt', args.plugins_txt), ('--loadorder-txt', args.loadorder_txt)):
-        if val and not (model.mo2_profile and os.path.dirname(os.path.abspath(val)) == model.mo2_profile):
+    for opt, val, own in (('--plugins-txt', args.plugins_txt, 'plugins.txt'),
+                          ('--loadorder-txt', args.loadorder_txt, 'loadorder.txt')):
+        same = model.mo2_profile and os.path.normcase(os.path.abspath(val or '')) == \
+            os.path.normcase(os.path.join(model.mo2_profile, own))
+        if val and not same:
             out.append(f'{opt} {q(os.path.abspath(val))}')
     for opt, val in (('--mods', args.mods), ('--ccc', args.ccc)):
         if val:
             out.append(f'{opt} {q(os.path.abspath(val))}')
-    out += [q(x) if ' ' in x else x for x in (args.plugins or [])]
+    out += [q(os.path.abspath(x) if os.path.isfile(x) else x) for x in (args.plugins or [])]
     return ' '.join(out)
 
 
-NOT_CHECKED_HEADER_ONLY = ('ESL object-ID ranges and new CELLs in light plugins, Skyrim LE record formats, '
-                           'LOOT masterlist/userlist rules, sorting, and record conflicts')
+NOT_CHECKED_HEADER_ONLY = ('damaged or truncated plugin files (only headers are read), ESL object-ID ranges and '
+                           'new CELLs in light plugins, header-1.70 plugins overriding object IDs below 0x800 of '
+                           '1.71 masters, Skyrim LE record formats, LOOT masterlist/userlist rules, sorting, and '
+                           'record conflicts')
 
 
 def cmd_check_order(args):
@@ -1159,6 +1164,12 @@ def cmd_check_order(args):
         plugins=args.plugins or None, data=args.data, plugins_txt=args.plugins_txt,
         loadorder_txt=args.loadorder_txt, mo2_profile=args.mo2, mods_dir=args.mods, ccc=args.ccc,
         header_only=True, use_metadata=False)
+    if model.order_unknown:
+        raise EspError('no plugins.txt found, so the load order is unknown: pass --plugins-txt (Steam: '
+                       '%LOCALAPPDATA%\\Skyrim Special Edition\\plugins.txt) or --mo2 "<MO2>/profiles/<name>"')
+    for i in model.issues:
+        if i.code == 'no-active-plugins':
+            raise EspError(i.message + ' ' + i.fix)
     issues = model.validate()
     secs = time.perf_counter() - t0
     order = model.effective_order()
@@ -1509,8 +1520,21 @@ def cmd_eslify(args):
 # argument parsing
 # ---------------------------------------------------------------------------
 
+class _Parser(argparse.ArgumentParser):
+    """Treats an abbreviation that matches several aliases of one option
+    (--plug: --plugins-txt / --plugins) as that option, not as ambiguous."""
+
+    def _get_option_tuples(self, option_string):
+        out, seen = [], set()
+        for t in super()._get_option_tuples(option_string):
+            if id(t[0]) not in seen:
+                seen.add(id(t[0]))
+                out.append(t)
+        return out
+
+
 def build_parser():
-    ap = argparse.ArgumentParser(
+    ap = _Parser(
         prog='esp.py', formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
         epilog='Examples:\n'
@@ -1799,10 +1823,14 @@ def normalize_argv(argv, commands):
     and `esp --data D info X.esp` mean `esp info X.esp` / `esp info X.esp --data D`.
     A lone plugin file (`esp X.esp`) means `esp info X.esp`."""
     argv = list(argv)
-    value_opts = {o for sp in commands.values() for a in sp._actions
-                  if a.option_strings and a.nargs != 0 for o in a.option_strings}
     if not argv or argv[0] in commands or argv[0] in ('-h', '--help'):
         return argv
+    takes_value, flag = set(), set()
+    for sp in commands.values():
+        for a in sp._actions:
+            (flag if a.nargs == 0 else takes_value).update(a.option_strings)
+    value_opts = takes_value - flag          # e.g. --records: a value in merge, a flag in tree
+    pos = []
     i = 0
     while i < len(argv):
         tok = argv[i]
@@ -1811,8 +1839,9 @@ def normalize_argv(argv, commands):
         if tok in value_opts:
             i += 2
             continue
+        if not tok.startswith('-'):
+            pos.append(tok)
         i += 1
-    pos = [t for t in argv if not t.startswith('-')]
     if len(pos) == 1 and pos[0].lower().endswith(PLUGIN_EXTS) and 'info' in commands:
         return ['info'] + argv
     return argv

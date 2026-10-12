@@ -426,8 +426,21 @@ class TestApiHelpers(Base):
         self.assertEqual(str(fk), '012EB7:Skyrim.esm')
         self.assertEqual(fk, FormKey.parse('012EB7:skyrim.ESM'))
         self.assertEqual(fk, FormKey.parse('Skyrim.esm:012EB7'))
-        self.assertEqual(fk, (0x12EB7, 'SKYRIM.ESM'))
         self.assertEqual(len({fk, FormKey(0x12EB7, 'skyrim.esm')}), 1)
+        # equal only to FormKeys, so == and hashing agree (a plain pair has another hash)
+        self.assertNotEqual(fk, (0x12EB7, 'Skyrim.esm'))
+        self.assertNotIn((0x12EB7, 'Skyrim.esm'), {fk})
+        self.assertEqual(FormKey(*(0x12EB7, 'SKYRIM.ESM')), fk)
+        lo_, up = FormKey(1, 'a.esp'), FormKey(1, 'A.esp')
+        self.assertFalse(lo_ < up or up < lo_)                      # ordering agrees with ==
+        self.assertEqual(sorted([FormKey(2, 'b.esp'), FormKey(1, 'Z.esp'), FormKey(1, 'a.esp')]),
+                         [FormKey(1, 'a.esp'), FormKey(1, 'z.esp'), FormKey(2, 'B.esp')])
+        self.assertEqual(b.local_formid((wa.object_id, 'TESTMASTER.ESM')), wb.formid)   # pairs still accepted
+        for bad in ('FE001800:LightMod.esp', '1012EB7:Skyrim.esm'):
+            with self.assertRaises(EspError):
+                FormKey.parse(bad)                                  # load-order byte is not part of a FormKey
+        with self.assertRaises(EspError):
+            b.local_formid((0x01000800, 'TestMaster.esm'))
         import copy
         import pickle
         self.assertEqual(pickle.loads(pickle.dumps(fk)), fk)
@@ -447,6 +460,59 @@ class TestApiHelpers(Base):
         b.add_master('Third.esm')
         self.assertEqual(b.formid_owner(2 << 24 | 0x800), 'Third.esm')
         self.assertEqual(b.formid_owner(3 << 24 | 0x800), 'ModB.esp')
+        b.set_header_string('MAST', 'Edited.esm')                   # edits the first MAST in place
+        self.assertEqual(b.formid_owner(0x800), 'Edited.esm')
+        mast = next(x for x in b.header.subrecords if x.sig == 'MAST')
+        mast.data = b'ByHand.esm\0'                                 # by hand, then touched() as documented
+        b.header.touched()
+        self.assertEqual(b.formid_owner(0x800), 'ByHand.esm')
+
+    def test_record_is_override_uses_master_cache(self):
+        from esplib import core
+        p = Plugin.new('Big.esp', [f'M{i:03d}.esm' for i in range(250)])
+        for i in range(300):
+            ops.new_record(p, 'MISC', f'Item{i:03d}', [])
+        calls = []
+        orig = core.Plugin.masters
+
+        def counting(self):
+            calls.append(1)
+            return orig.fget(self)
+        core.Plugin.masters = property(counting)
+        try:
+            self.assertFalse(any(r.is_override for r in p.records()))
+            self.assertTrue(all(r.formkey.plugin == 'Big.esp' for r in p.records()))
+        finally:
+            core.Plugin.masters = orig
+        self.assertLessEqual(len(calls), 2)
+
+    def test_header_only_and_headerless_lookups_always_raise(self):
+        h = Plugin.load_header(self.p('ModA.esp'))
+        a = Plugin.load(self.p('ModA.esp'))
+        fk = next(r for r in a.records() if not r.is_override).formkey
+        for _ in range(2):                                          # no half-built index after the first error
+            for fn in (lambda: h.find(0x800), lambda: h.find(fk), lambda: h.find_edid('X'), lambda: h.index()):
+                with self.assertRaises(EspError):
+                    fn()
+        bare = Plugin('ModA.esp')
+        for fn in (lambda: list(bare.records()), lambda: bare.find(0x800), lambda: bare.find_edid('X')):
+            with self.assertRaises(EspError) as cm:
+                fn()
+            self.assertIn('Plugin.load(path)', str(cm.exception))
+
+    def test_field_compare_ignores_master_name_case(self):
+        lo = self.lo()
+        tm = lo.add(self.p('TestMaster.esm'))
+        low = Plugin.new('Lower.esp', ['testmaster.esm'])
+        low.path = self.p('Lower.esp')
+        lo.add(low)
+        src = tm.find_edid('IronSword')
+        new, _ = ops.copy_record(lo, tm, src, low)
+        self.assertEqual(ops.diff_records(src, tm, new, low), [])       # same values, master spelled differently
+        self.assertTrue(ops.is_itm(new, low, src, tm, lo))
+        ops.apply_edits(lo, low, new, [('DATA.damage', '=', '99')])
+        d = ops.diff_records(src, tm, new, low)
+        self.assertEqual([k for k, _a, _b in d], ['DATA'])
 
     def test_conflicts_match_master_names_case_insensitively(self):
         lo = self.lo()
@@ -473,6 +539,9 @@ class TestCliArgumentOrder(Base):
                          self.cli('info', 'ModA.esp', '--data', self.tmp).stdout)
         self.assertEqual(self.cli('ModB.esp', 'list', '-t', 'WEAP').stdout,
                          self.cli('list', 'ModB.esp', '-t', 'WEAP').stdout)
+        self.assertEqual(self.cli('--data', self.tmp, 'ModA.esp').stdout, want)       # lone file + option
+        self.assertEqual(self.cli('ModA.esp', '--records', 'tree').stdout,
+                         self.cli('tree', 'ModA.esp', '--records').stdout)      # --records: a flag in tree
         r = self.cli('ModA.esp', 'nosuchcommand', ok=False)
         self.assertNotEqual(r.returncode, 0)
 

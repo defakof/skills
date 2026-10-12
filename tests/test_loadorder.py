@@ -1124,6 +1124,85 @@ class TestCheckOrder(LoBase):
         self.assertEqual(r.returncode, 2)
         self.assertIn('--data', r.stderr)
 
+    def test_wrong_list_files_are_refused(self):
+        bad = {
+            'a plugin': os.path.join(self.data, 'ModA.esp'),
+            'modlist.txt': None,
+            'Skyrim.ccc': os.path.join(self.root, 'Skyrim.ccc'),
+        }
+        ml = os.path.join(self.tmp, 'co_modlist.txt')
+        with open(ml, 'w') as f:
+            f.write('# managed by MO2\n+Some Mod\n-Other Mod\n')
+        bad['modlist.txt'] = ml
+        for what, path in bad.items():
+            r = self.run_cli('check-order', '--data', self.data, '--plugins', path)
+            self.assertEqual(r.returncode, 2, (what, r.stdout))
+            self.assertIn('error:', r.stderr, what)
+        r = self.run_cli('loadorder', '--data', self.data, '--plugins-txt', bad['Skyrim.ccc'], '--no-loot', '--json')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('no-active-plugins', [i['code'] for i in json.loads(r.stdout)['issues']])
+        r = self.run_cli('check-order', '--data', self.data, '--plugins', self.ptxt, os.path.join(self.data, 'ModA.esp'))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('not both', r.stderr)
+
+    def test_unknown_order_is_not_checked(self):
+        m = Mini(os.path.join(self.tmp, 'co_noorder'))
+        m.new('B.esp', ['Skyrim.esm', 'Z.esp'])
+        m.new('Z.esp', ['Skyrim.esm'])
+        m.save(plugins_txt=False)
+        env = {**os.environ, 'ESP_CACHE_DIR': self.cache, 'LOCALAPPDATA': self.tmp, 'HOME': self.tmp,
+               'USERPROFILE': self.tmp}
+        r = subprocess.run([sys.executable, ESP, 'check-order', '--data', m.data], capture_output=True,
+                           encoding='utf-8', errors='replace', env=env, check=False)
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn('load order is unknown', r.stderr)
+
+    def test_explicit_list_master_on_disk_is_inactive_not_missing(self):
+        m = Mini(os.path.join(self.tmp, 'co_explicit'))
+        m.new('Update.esm', ['Skyrim.esm'], esm=True)
+        m.new('A.esp', ['Skyrim.esm'])
+        m.new('B.esp', ['Skyrim.esm', 'A.esp'])
+        m.save(plugins_txt=False)
+        r = self.run_cli('check-order', '--data', m.data, 'Skyrim.esm', 'Update.esm', 'B.esp', '--json')
+        self.assertEqual(r.returncode, 1, r.stderr)
+        errs = [i for i in json.loads(r.stdout)['issues'] if i['level'] == 'error']
+        self.assertEqual([(i['code'], i['plugin'], i['related']) for i in errs], [('inactive-master', 'B.esp', ['A.esp'])])
+        self.assertIn('not in the load order', errs[0]['message'])
+
+    def test_profile_detection_needs_the_profiles_own_files(self):
+        m = Mini(os.path.join(self.tmp, 'co_other_txt'))
+        m.new('Update.esm', ['Skyrim.esm'], esm=True)
+        m.new('A.esp', ['Skyrim.esm'])
+        m.save(plugins_txt=False)
+        inst = os.path.join(m.root, 'MO2')
+        prof = os.path.join(inst, 'profiles', 'P')
+        os.makedirs(os.path.join(inst, 'mods', 'Mod A'))
+        shutil.move(os.path.join(m.data, 'A.esp'), os.path.join(inst, 'mods', 'Mod A'))
+        os.makedirs(prof)
+        with open(os.path.join(inst, 'ModOrganizer.ini'), 'w') as f:
+            f.write('[General]\ngamePath=@ByteArray({})\n'.format(m.root.replace('\\', '\\\\')))
+        for n, text in (('modlist.txt', '+Mod A\n'), ('plugins.txt', '*A.esp\n'), ('loadorder.txt', 'A.esp\n'),
+                        ('backup.txt', '*A.esp\n')):
+            with open(os.path.join(prof, n), 'w') as f:
+                f.write(text)
+        r = self.run_cli('check-order', '--plugins', os.path.join(prof, 'backup.txt'))
+        self.assertEqual(r.returncode, 2, r.stdout)                  # another list in the folder: no MO2 mode
+        r = self.run_cli('check-order', '--mo2', prof, '--plugins-txt', os.path.join(prof, 'backup.txt'))
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn('--plugins-txt "{}"'.format(os.path.join(os.path.abspath(prof), 'backup.txt')), r.stdout)
+        r = self.run_cli('check-order', '--mo2', prof, '--plugins-txt', os.path.join(prof, 'plugins.txt'))
+        self.assertNotIn('--plugins-txt', r.stdout.splitlines()[-1])  # the profile's own file is implied
+        for args in (['--plug', os.path.join(prof, 'plugins.txt')], ['--prof', prof],
+                     ['--mo2', prof, '--load', os.path.join(prof, 'loadorder.txt')]):
+            r = self.run_cli('check-order', *args)                    # abbreviations of aliased options
+            self.assertEqual(r.returncode, 0, (args, r.stderr))
+        os.remove(os.path.join(inst, 'ModOrganizer.ini'))
+        shutil.rmtree(os.path.join(inst, 'mods'))
+        r = self.run_cli('check-order', '--mo2', prof)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('ModOrganizer.ini', r.stderr)
+        self.assertIn('--data', r.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()

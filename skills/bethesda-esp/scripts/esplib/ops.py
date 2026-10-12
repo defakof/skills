@@ -576,8 +576,23 @@ def undelete_and_disable(plugin, rec):
 # comparison helpers
 # ---------------------------------------------------------------------------
 
-def normalized(rec, plugin, strings=None):
-    """Plugin-independent representation (FormKeys instead of local ids)."""
+def _cmp_jsonable(v, plugin):
+    """to_jsonable() with FormIDs as FormKeys whose plugin name is case-folded,
+    so 'Skyrim.esm' in one master list equals 'skyrim.esm' in another."""
+    if isinstance(v, FormID):
+        fk = plugin.formkey(int(v))
+        return f'{fk[0]:06X}:{fk[1].lower()}' if fk is not None else to_jsonable(v, plugin)
+    if isinstance(v, dict):
+        return {k: _cmp_jsonable(x, plugin) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_cmp_jsonable(x, plugin) for x in v]
+    return to_jsonable(v, plugin)
+
+
+def normalized(rec, plugin, strings=None, fold_case=True):
+    """Plugin-independent representation (FormKeys instead of local ids); with
+    fold_case the plugin names in FormKeys are lower-cased (for comparing)."""
+    conv = _cmp_jsonable if fold_case else to_jsonable
     out = []
     for d in decode_record(rec, plugin):
         v = d.value
@@ -586,7 +601,7 @@ def normalized(rec, plugin, strings=None):
                 v = delocalize_value(v, strings, d.sig, [])
             except EspError:
                 pass
-        out.append((d.sig, json.dumps(to_jsonable(v, plugin), sort_keys=True, ensure_ascii=False)))
+        out.append((d.sig, json.dumps(conv(v, plugin), sort_keys=True, ensure_ascii=False)))
     return out
 
 
@@ -594,33 +609,37 @@ def record_flags_for_compare(rec):
     return rec.flags & ~FLAG_COMPRESSED
 
 
+def _keyed(items):
+    """{'SIG' / 'SIG#n': value} and the key order, for repeated subrecords."""
+    seen = {}
+    out = {}
+    order = []
+    for sig, v in items:
+        n = seen.get(sig, 0)
+        seen[sig] = n + 1
+        k = f'{sig}#{n}' if n else sig
+        out[k] = v
+        order.append(k)
+    return out, order
+
+
 def diff_records(a, pa, b, pb, sa=None, sb=None):
     """Field-level differences between two versions of a record.
     Returns list of (sig#n, value_a, value_b)."""
-    na = normalized(a, pa, sa)
-    nb = normalized(b, pb, sb)
-
-    def keyed(items):
-        seen = {}
-        out = {}
-        order = []
-        for sig, v in items:
-            n = seen.get(sig, 0)
-            seen[sig] = n + 1
-            k = f'{sig}#{n}' if n else sig
-            out[k] = v
-            order.append(k)
-        return out, order
-    ka, oa = keyed(na)
-    kb, ob = keyed(nb)
+    ka, oa = _keyed(normalized(a, pa, sa))
+    kb, ob = _keyed(normalized(b, pb, sb))
     keys = oa + [k for k in ob if k not in ka]
     diffs = []
     if record_flags_for_compare(a) != record_flags_for_compare(b):
         diffs.append(('@flags', flags_to_names(a.flags & ~FLAG_COMPRESSED, RECORD_FLAG_NAMES),
                       flags_to_names(b.flags & ~FLAG_COMPRESSED, RECORD_FLAG_NAMES)))
+    shown_a = shown_b = None
     for k in keys:
-        va, vb = ka.get(k), kb.get(k)
-        if va != vb:
+        if ka.get(k) != kb.get(k):
+            if shown_a is None:      # show FormKeys as each plugin spells them
+                shown_a = _keyed(normalized(a, pa, sa, fold_case=False))[0]
+                shown_b = _keyed(normalized(b, pb, sb, fold_case=False))[0]
+            va, vb = shown_a.get(k), shown_b.get(k)
             diffs.append((k, json.loads(va) if va else None, json.loads(vb) if vb else None))
     return diffs
 

@@ -184,7 +184,7 @@ These commands share the load-order options:
 | option | meaning |
 |---|---|
 | `PLUGIN...` | plugin files or names in load order (instead of a plugins.txt; all treated as active) |
-| `--plugins-txt FILE` (alias `--plugins`) | the game's or a profile's plugins.txt (`*` = active); one inside an MO2 profile folder (`<MO2>/profiles/<name>/plugins.txt`) works like `--mo2` on that folder |
+| `--plugins-txt FILE` (alias `--plugins`) | the game's or a profile's plugins.txt (`*` = active); an MO2 profile's own `plugins.txt` (`<MO2>/profiles/<name>/plugins.txt`) works like `--mo2` on that folder. A plugin file or a file without plugin lines is refused |
 | `--mo2 PROFILE_DIR` (alias `--profile`) | MO2 profile folder: reads its plugins.txt/loadorder.txt/modlist.txt and ModOrganizer.ini (game path, mods folder); plugin files are found by mod priority |
 | `--data DIR` | game Data folder (also locates `Skyrim.ccc` and `SkyrimSE.exe` next to it). A plugins.txt only names plugins: without `--data` or `--mo2` the files cannot be found (error) |
 | `--loadorder-txt FILE` (alias `--loadorder`) | compared with plugins.txt (desync warning); used alone only if there is no plugins.txt |
@@ -200,11 +200,14 @@ Fast check from plugin headers only (a few hundred bytes per plugin, well under 
 1000+ plugins, nothing cached): missing/ghosted/inactive masters, plugins loading before their
 masters, masters that need a regular plugin, master cycles, the 254/4096 limits, ESM/ESL flags
 and header versions (LE header, 1.71 vs game version/BEES), generated-patch placement, missing or
-duplicate entries. Exit code `1` when there are errors (`0` otherwise), so scripts can use it as a
-gate. Not checked (needs whole files): ESL object-ID ranges, new CELLs in light plugins, LE record
-formats, LOOT rules, sorting, conflicts - the output ends with the matching `esp loadorder`
-command. `--list` prints the effective order (index, flags, master count); `--json` gives
-`ok`, `counts`, `effective_order` (with each plugin's masters), `issues`, `full_check`.
+duplicate entries. Exit code `1` when there are errors, `0` when there are none, `2` when the input
+is wrong: no plugins.txt found (order unknown), a plugin or other non-list file given as
+`--plugins`, a plugins.txt with no active (`*`) entry, or plugin files and a plugins.txt together.
+Not checked (needs whole files): damaged/truncated plugin files, ESL object-ID ranges, new CELLs in
+light plugins, `hedr-low-range`, LE record formats, LOOT rules, sorting, conflicts - the output ends
+with the matching `esp loadorder` command. `--list` prints the effective order (index, flags,
+master count); `--json` gives `ok`, `counts`, `effective_order` (with each plugin's masters),
+`issues`, `full_check`.
 
 ### loadorder [options] [--rules FILE] [--write FILE] [--write-loadorder FILE] [--groups] [--sources] [--all] [--brief] [--full-order] [--no-overlap] [--no-groups] [--json]
 Effective order with load indices (`00`, `FE:001`), flags, new/override counts, then problems and
@@ -229,7 +232,7 @@ suggested moves with reasons. Codes (level):
 | `dirty` | warning | CRC matches a LOOT dirty entry (ITM/UDR/deleted navmesh counts) |
 | `after-generated`, `generated-order`, `synthesis-split`, `stale-patch` | warning | generated patch placement / out of date |
 | `le-header`, `le-records` | warning/info | Skyrim LE plugin not converted |
-| `esl-new-cell`, `near-plugin-limit`, `not-found`, `duplicate-entry`, `bad-filename`, `lo-desync` | warning | |
+| `esl-new-cell`, `near-plugin-limit`, `not-found`, `duplicate-entry`, `bad-filename`, `lo-desync`, `no-active-plugins` | warning | `no-active-plugins`: the plugins.txt marks nothing active (wrong file?) |
 | `master-partition`, `unlisted`, `hedr-171`, `no-ccc` | info (shown with `--all`) | |
 
 `--rules` JSON: `{"Plugin.esp": {"after": ["Other.esp"], "before": ["X.esp"]}}` (hard rules, like
