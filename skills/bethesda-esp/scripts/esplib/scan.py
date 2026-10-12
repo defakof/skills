@@ -29,6 +29,8 @@ PLACED_TYPES = {'REFR', 'ACHR', 'PGRE', 'PMIS', 'PARW', 'PBAR', 'PBEA', 'PCON', 
 class PluginScan:
     """Compact summary of one plugin file."""
 
+    header_only = False                 # scan_header(): header fields only, no records
+
     def __init__(self):
         self.name = ''
         self.path = ''
@@ -151,12 +153,9 @@ def _has_vmad(buf, dstart, size, flags):
         return False
 
 
-def scan_bytes(buf, name, path=''):
-    s = PluginScan()
-    s.name = name
-    s.path = path
-    s.size = len(buf)
-    s.crc = zlib.crc32(buf) & 0xFFFFFFFF
+def _read_header(s, buf, name):
+    """Fill the header fields of s from buf (at least the TES4 record);
+    returns the TES4 data size."""
     if len(buf) < 24 or buf[:4] != b'TES4':
         raise EspError(f'{name}: not a TES4-format plugin')
     _, hsize, hflags, _ = _REC.unpack_from(buf, 0)
@@ -164,7 +163,7 @@ def scan_bytes(buf, name, path=''):
         raise EspError(f'{name}: truncated file (the plugin header is cut off)')
     s.flags = hflags
     s.form_version = _VER.unpack_from(buf, 20)[0]
-    for sub in parse_subrecords(buf[24:24 + hsize]):
+    for sub in parse_subrecords(bytes(buf[24:24 + hsize])):
         if sub.sig == 'HEDR' and len(sub.data) >= 12:
             s.hedr_version, s.hedr_records, s.next_object_id = struct.unpack_from('<fII', sub.data)
         elif sub.sig == 'MAST':
@@ -173,6 +172,16 @@ def scan_bytes(buf, name, path=''):
             s.author = sub.data.split(b'\0', 1)[0].decode('cp1252', errors='replace')
         elif sub.sig == 'SNAM':
             s.description = sub.data.split(b'\0', 1)[0].decode('cp1252', errors='replace')
+    return hsize
+
+
+def scan_bytes(buf, name, path=''):
+    s = PluginScan()
+    s.name = name
+    s.path = path
+    s.size = len(buf)
+    s.crc = zlib.crc32(buf) & 0xFFFFFFFF
+    hsize = _read_header(s, buf, name)
     own = len(s.masters)
     sig_index = {}
     formids, sig_ids, rflags = s.formids, s.sig_ids, s.rflags
@@ -228,6 +237,27 @@ def scan_bytes(buf, name, path=''):
             if ssig not in PLACED_TYPES and _has_vmad(buf, dstart, size, flags):
                 s.has_scripts += 1
         pos = dstart + size
+    return s
+
+
+def scan_header(path):
+    """Header-only scan (masters, flags, versions, author, description): reads
+    the TES4 record and nothing else, so it costs one small read per plugin.
+    Record lists stay empty and header_only is True. Never cached."""
+    path = os.path.abspath(path)
+    name = os.path.basename(path)
+    if name.lower().endswith('.ghost'):
+        name = name[:-6]
+    s = PluginScan()
+    s.name, s.path = name, path
+    st = os.stat(path)
+    s.size, s.mtime = st.st_size, st.st_mtime
+    with open(path, 'rb') as f:
+        head = f.read(24)
+        if len(head) == 24 and head[:4] == b'TES4':
+            head += f.read(_REC.unpack_from(head, 0)[1])
+    _read_header(s, head, name)
+    s.header_only = True
     return s
 
 

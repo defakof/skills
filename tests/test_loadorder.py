@@ -533,10 +533,6 @@ class TestCli(LoBase):
         self.assertIn('Eslable.esp', text)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class Mini:
     """A tiny load order built in a temp folder, for one scenario."""
 
@@ -1031,3 +1027,192 @@ class TestMo2Commands(LoBase):
         shown = self.cli('show', os.path.join(mods, 'My Patch', 'Patch.esp'), 'FoodApple', '--mo2', prof)
         self.assertIn('value=4', shown)
         self.assertIn('weight=0.2', shown)
+
+
+class TestCheckOrder(LoBase):
+    """esp check-order: the fast, header-only load order check."""
+
+    RECORD_LEVEL = frozenset({'hedr-low-range', 'esl-range', 'esl-id-zero', 'esl-new-cell', 'le-records'})
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, ESP, *args], capture_output=True, encoding='utf-8',
+                              errors='replace', env={**os.environ, 'ESP_CACHE_DIR': self.cache}, check=False)
+
+    def test_finds_master_and_order_errors(self):
+        r = self.run_cli('check-order', '--data', self.data, '--plugins', self.ptxt)
+        self.assertEqual(r.returncode, 1, r.stderr + r.stdout)
+        for code in ('missing-master', 'inactive-master', 'master-order', 'master-needs-nonmaster'):
+            self.assertIn(f'[{code}]', r.stdout)
+        self.assertIn('FAILED', r.stdout)
+        self.assertIn(f'esp loadorder --data "{self.data}" --plugins-txt "{self.ptxt}"', r.stdout)
+        r = self.run_cli('check-order', '--data', self.data, '--plugins-txt', self.ptxt, '--json', '--list')
+        self.assertEqual(r.returncode, 1, r.stderr)
+        d = json.loads(r.stdout)
+        self.assertFalse(d['ok'])
+        self.assertEqual(d['checked'], 'plugin headers only')
+        self.assertEqual(d['counts']['full_limit'], 254)
+        names = [e['name'] for e in d['effective_order']]
+        self.assertEqual(names[:2], ['Skyrim.esm', 'Update.esm'])
+        missing = [i for i in d['issues'] if i['code'] == 'missing-master']
+        self.assertEqual([(i['plugin'], i['related']) for i in missing], [('MissingMaster.esp', ['NotInstalled.esp'])])
+
+    def test_clean_order_exits_zero(self):
+        m = Mini(os.path.join(self.tmp, 'co_clean'))
+        m.new('Update.esm', ['Skyrim.esm'], esm=True)
+        m.new('A.esp', ['Skyrim.esm'])
+        m.new('B.esp', ['Skyrim.esm', 'A.esp'])
+        m.new('Light.esp', ['Skyrim.esm'], esl=True)
+        m.save()
+        r = self.run_cli('check-order', '--data', m.data, '--plugins', os.path.join(m.root, 'plugins.txt'))
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn('OK: no errors', r.stdout)
+        self.assertIn('4 full (of 254 slots), 1 light', r.stdout)       # Skyrim, Update, A, B
+
+    def test_header_only_model_agrees_with_full_check(self):
+        """Every finding of the header-only check is also a finding of the full check, and the full
+        check adds only record-level and LOOT findings."""
+        common = {'data': self.data, 'plugins_txt': self.ptxt, 'userlist': '', 'masterlist': 'none',
+                  'use_metadata': False}
+        head = lorder.LoadOrderModel.from_sources(header_only=True, **common)
+        full = lorder.LoadOrderModel.from_sources(**common)
+        self.assertTrue(head.header_only)
+        self.assertTrue(all(e.scan.header_only and not len(e.scan.formids) for e in head.active() if e.scan))
+        hi = {(i.code, i.plugin) for i in head.validate()}
+        fi = {(i.code, i.plugin) for i in full.validate()}
+        self.assertTrue(hi)
+        self.assertLessEqual(hi, fi)
+        self.assertLessEqual({c for c, _ in fi - hi}, self.RECORD_LEVEL)
+        self.assertEqual([e.name for e in head.effective_order()], [e.name for e in full.effective_order()])
+
+    def test_mo2_profile_from_plugins_txt_and_aliases(self):
+        m = Mini(os.path.join(self.tmp, 'co_mo2'))
+        m.new('Update.esm', ['Skyrim.esm'], esm=True)
+        m.new('A.esp', ['Skyrim.esm'])
+        m.new('B.esp', ['Skyrim.esm', 'Missing.esp'])
+        m.save(plugins_txt=False)
+        inst = os.path.join(m.root, 'MO2')
+        prof = os.path.join(inst, 'profiles', 'Default')
+        os.makedirs(prof)
+        for n in ('A.esp', 'B.esp'):
+            d = os.path.join(inst, 'mods', 'Mod ' + n)
+            os.makedirs(d)
+            shutil.move(os.path.join(m.data, n), d)
+        with open(os.path.join(inst, 'ModOrganizer.ini'), 'w') as f:
+            f.write('[General]\ngamePath=@ByteArray({})\n'.format(m.root.replace('\\', '\\\\')))
+        with open(os.path.join(prof, 'modlist.txt'), 'w') as f:
+            f.write('+Mod B.esp\n+Mod A.esp\n')
+        with open(os.path.join(prof, 'plugins.txt'), 'w') as f:
+            f.write('*A.esp\n*B.esp\n')
+        with open(os.path.join(prof, 'loadorder.txt'), 'w') as f:
+            f.write('Skyrim.esm\nA.esp\nB.esp\n')
+        outs = []
+        for args in (['--plugins', os.path.join(prof, 'plugins.txt')], ['--profile', prof], ['--mo2', prof],
+                     ['--loadorder', os.path.join(prof, 'loadorder.txt')]):
+            r = self.run_cli('check-order', *args, '--json')
+            self.assertEqual(r.returncode, 1, (args, r.stderr))
+            d = json.loads(r.stdout)
+            self.assertEqual(d['manager'], 'MO2', args)
+            outs.append(sorted((i['code'], i['plugin']) for i in d['issues'] if i['level'] == 'error'))
+        self.assertEqual(outs[0], [('missing-master', 'B.esp')])
+        self.assertTrue(all(o == outs[0] for o in outs), outs)
+        r = self.run_cli('--profile', prof, 'check-order')                      # options before the command
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn(f'esp loadorder --mo2 "{os.path.abspath(prof)}"', r.stdout)
+
+    def test_plugins_txt_without_data_is_an_error(self):
+        r = self.run_cli('check-order', '--plugins', self.ptxt)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('--data', r.stderr)
+
+    def test_wrong_list_files_are_refused(self):
+        bad = {
+            'a plugin': os.path.join(self.data, 'ModA.esp'),
+            'modlist.txt': None,
+            'Skyrim.ccc': os.path.join(self.root, 'Skyrim.ccc'),
+        }
+        ml = os.path.join(self.tmp, 'co_modlist.txt')
+        with open(ml, 'w') as f:
+            f.write('# managed by MO2\n+Some Mod\n-Other Mod\n')
+        bad['modlist.txt'] = ml
+        u16 = os.path.join(self.tmp, 'co_utf16.txt')
+        with open(u16, 'wb') as f:
+            f.write('*ModA.esp\r\n'.encode('utf-16'))
+        bad['UTF-16 plugins.txt'] = u16
+        for text in ('', '# only a comment\n', '\ufeff*ModA.esp\n'):              # still fine
+            ok = os.path.join(self.tmp, 'co_ok.txt')
+            with open(ok, 'w', encoding='utf-8') as f:
+                f.write(text)
+            r = self.run_cli('check-order', '--data', self.data, '--plugins', ok)
+            self.assertIn(r.returncode, (0, 1), (text, r.stderr))
+        for what, path in bad.items():
+            r = self.run_cli('check-order', '--data', self.data, '--plugins', path)
+            self.assertEqual(r.returncode, 2, (what, r.stdout))
+            self.assertIn('error:', r.stderr, what)
+        r = self.run_cli('loadorder', '--data', self.data, '--plugins-txt', bad['Skyrim.ccc'], '--no-loot', '--json')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('no-active-plugins', [i['code'] for i in json.loads(r.stdout)['issues']])
+        r = self.run_cli('check-order', '--data', self.data, '--plugins', self.ptxt, os.path.join(self.data, 'ModA.esp'))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('not both', r.stderr)
+
+    def test_unknown_order_is_not_checked(self):
+        m = Mini(os.path.join(self.tmp, 'co_noorder'))
+        m.new('B.esp', ['Skyrim.esm', 'Z.esp'])
+        m.new('Z.esp', ['Skyrim.esm'])
+        m.save(plugins_txt=False)
+        env = {**os.environ, 'ESP_CACHE_DIR': self.cache, 'LOCALAPPDATA': self.tmp, 'HOME': self.tmp,
+               'USERPROFILE': self.tmp}
+        r = subprocess.run([sys.executable, ESP, 'check-order', '--data', m.data], capture_output=True,
+                           encoding='utf-8', errors='replace', env=env, check=False)
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn('load order is unknown', r.stderr)
+
+    def test_explicit_list_master_on_disk_is_inactive_not_missing(self):
+        m = Mini(os.path.join(self.tmp, 'co_explicit'))
+        m.new('Update.esm', ['Skyrim.esm'], esm=True)
+        m.new('A.esp', ['Skyrim.esm'])
+        m.new('B.esp', ['Skyrim.esm', 'A.esp'])
+        m.save(plugins_txt=False)
+        r = self.run_cli('check-order', '--data', m.data, 'Skyrim.esm', 'Update.esm', 'B.esp', '--json')
+        self.assertEqual(r.returncode, 1, r.stderr)
+        errs = [i for i in json.loads(r.stdout)['issues'] if i['level'] == 'error']
+        self.assertEqual([(i['code'], i['plugin'], i['related']) for i in errs], [('inactive-master', 'B.esp', ['A.esp'])])
+        self.assertIn('not in the load order', errs[0]['message'])
+
+    def test_profile_detection_needs_the_profiles_own_files(self):
+        m = Mini(os.path.join(self.tmp, 'co_other_txt'))
+        m.new('Update.esm', ['Skyrim.esm'], esm=True)
+        m.new('A.esp', ['Skyrim.esm'])
+        m.save(plugins_txt=False)
+        inst = os.path.join(m.root, 'MO2')
+        prof = os.path.join(inst, 'profiles', 'P')
+        os.makedirs(os.path.join(inst, 'mods', 'Mod A'))
+        shutil.move(os.path.join(m.data, 'A.esp'), os.path.join(inst, 'mods', 'Mod A'))
+        os.makedirs(prof)
+        with open(os.path.join(inst, 'ModOrganizer.ini'), 'w') as f:
+            f.write('[General]\ngamePath=@ByteArray({})\n'.format(m.root.replace('\\', '\\\\')))
+        for n, text in (('modlist.txt', '+Mod A\n'), ('plugins.txt', '*A.esp\n'), ('loadorder.txt', 'A.esp\n'),
+                        ('backup.txt', '*A.esp\n')):
+            with open(os.path.join(prof, n), 'w') as f:
+                f.write(text)
+        r = self.run_cli('check-order', '--plugins', os.path.join(prof, 'backup.txt'))
+        self.assertEqual(r.returncode, 2, r.stdout)                  # another list in the folder: no MO2 mode
+        r = self.run_cli('check-order', '--mo2', prof, '--plugins-txt', os.path.join(prof, 'backup.txt'))
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn('--plugins-txt "{}"'.format(os.path.join(os.path.abspath(prof), 'backup.txt')), r.stdout)
+        r = self.run_cli('check-order', '--mo2', prof, '--plugins-txt', os.path.join(prof, 'plugins.txt'))
+        self.assertNotIn('--plugins-txt', r.stdout.splitlines()[-1])  # the profile's own file is implied
+        for args in (['--plug', os.path.join(prof, 'plugins.txt')], ['--prof', prof],
+                     ['--mo2', prof, '--load', os.path.join(prof, 'loadorder.txt')]):
+            r = self.run_cli('check-order', *args)                    # abbreviations of aliased options
+            self.assertEqual(r.returncode, 0, (args, r.stderr))
+        os.remove(os.path.join(inst, 'ModOrganizer.ini'))
+        shutil.rmtree(os.path.join(inst, 'mods'))
+        r = self.run_cli('check-order', '--mo2', prof)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('ModOrganizer.ini', r.stderr)
+        self.assertIn('--data', r.stderr)
+
+
+if __name__ == '__main__':
+    unittest.main()

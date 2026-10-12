@@ -98,6 +98,80 @@ class EspError(Exception):
     pass
 
 
+class FormKey(tuple):
+    """Record identity that does not depend on a plugin's master list:
+    (object ID, name of the plugin that defines the record).
+
+    FormIDs in a plugin file are file-local - the top byte indexes that
+    plugin's own master list - so the same record is 0x01012EB7 in one patch
+    and 0x05012EB7 in another. FormKeys compare equal across plugins (plugin
+    names case-insensitively) and work as dict/set keys. They compare equal
+    only to other FormKeys: wrap a plain (id, name) pair with FormKey(*pair).
+    str() gives the CLI notation '012EB7:Skyrim.esm'; FormKey.parse() reads it back."""
+
+    __slots__ = ()
+
+    def __new__(cls, object_id, plugin):
+        return tuple.__new__(cls, (int(object_id) & 0xFFFFFF, str(plugin)))
+
+    @classmethod
+    def parse(cls, text):
+        """'012EB7:Skyrim.esm' or 'Skyrim.esm:012EB7'."""
+        s = str(text).strip()
+        a, sep, b = s.partition(':')
+        for oid, name in ((a.strip(), b), (b.strip(), a)):
+            if sep and oid and '.' in name and all(c in '0123456789abcdefABCDEF' for c in oid):
+                if int(oid, 16) > 0xFFFFFF:
+                    raise EspError(f'object ID too large in {s!r}: a FormKey has 6 hex digits (012EB7:Skyrim.esm), '
+                                   'without the load-order byte')
+                return cls(int(oid, 16), name.strip())
+        raise EspError(f'not a FormKey: {s!r} (expected 012EB7:Skyrim.esm)')
+
+    @property
+    def object_id(self):
+        return self[0]
+
+    @property
+    def plugin(self):
+        return self[1]
+
+    def _key(self):
+        return self[0], self[1].lower()
+
+    def __eq__(self, other):
+        if isinstance(other, FormKey):
+            return self._key() == other._key()
+        return False if isinstance(other, tuple) else NotImplemented
+
+    def __ne__(self, other):
+        eq = self.__eq__(other)
+        return eq if eq is NotImplemented else not eq
+
+    def __lt__(self, other):
+        return self._key() < other._key() if isinstance(other, FormKey) else NotImplemented
+
+    def __le__(self, other):
+        return self._key() <= other._key() if isinstance(other, FormKey) else NotImplemented
+
+    def __gt__(self, other):
+        return self._key() > other._key() if isinstance(other, FormKey) else NotImplemented
+
+    def __ge__(self, other):
+        return self._key() >= other._key() if isinstance(other, FormKey) else NotImplemented
+
+    def __hash__(self):
+        return hash(self._key())
+
+    def __getnewargs__(self):          # pickle / copy
+        return (self[0], self[1])
+
+    def __str__(self):
+        return f'{self[0]:06X}:{self[1]}'
+
+    def __repr__(self):
+        return f"FormKey('{self}')"
+
+
 def sig_str(b):
     return b.decode('latin-1')
 
@@ -247,6 +321,8 @@ class Record:
             self.subrecords  # noqa: B018 - force parse
         self._raw = None
         self._edid = False
+        if self.sig == 'TES4' and self.plugin is not None:
+            self.plugin._mcache = None          # the master list may have changed
 
     @property
     def is_modified(self):
@@ -306,6 +382,37 @@ class Record:
     @property
     def is_deleted(self):
         return bool(self.flags & FLAG_DELETED)
+
+    # -- identity across plugins -------------------------------------------
+    @property
+    def object_id(self):
+        """The FormID without its master-index byte (formid & 0xFFFFFF)."""
+        return self.formid & 0xFFFFFF
+
+    local_id = object_id
+
+    def _owning_plugin(self, plugin):
+        plugin = plugin if plugin is not None else self.plugin
+        if plugin is None:
+            raise EspError(f'{self.label()} belongs to no plugin: pass the plugin it was read from')
+        return plugin
+
+    def master_name(self, plugin=None):
+        """Name of the plugin that defines this record: a master of the plugin
+        it was read from (an override), or that plugin itself (a new record).
+        None when the FormID's master index is past the master list."""
+        return self._owning_plugin(plugin).formid_owner(self.formid)
+
+    @property
+    def formkey(self):
+        """FormKey (object ID, defining plugin): equal for the same record in
+        any plugin, whatever the master lists. None for an invalid master index."""
+        return self._owning_plugin(None).formkey(self.formid)
+
+    @property
+    def is_override(self):
+        """True when the record comes from a master (it overrides it)."""
+        return (self.formid >> 24) < len(self._owning_plugin(None)._master_list())
 
     def label(self):
         e = None
@@ -468,18 +575,48 @@ def _read_items(buf, start, end, parent, plugin):
 
 
 class Plugin:
-    """An in-memory plugin. Use Plugin.load(path) or Plugin.new(name)."""
+    """An in-memory plugin. Plugin.load(path) reads a file, Plugin.load_header(path)
+    only its header (masters, flags, versions), Plugin.new(name) starts an empty one.
+    Plugin(name) itself reads nothing."""
 
     def __init__(self, name='New.esp'):
+        name = os.fspath(name)
+        if '/' in name or '\\' in name or os.path.basename(name) != name:
+            raise ValueError(f'Plugin() takes a plugin name, not a path ({name!r}): use Plugin.load(path) to '
+                             'read a plugin file, Plugin.load_header(path) for just its masters and flags, '
+                             'or Plugin.new(name) for a new plugin')
         self.path = None
         self.name = name
-        self.header = None
+        self._header = None
+        self.header_only = False          # True after load_header(): no records were read
         self.root = Group(b'\0\0\0\0', -1)   # pseudo group holding top groups
         self.encoding = os.environ.get('ESP_ENCODING', 'cp1252')
         self._index = None
         self._edid_index = None
+        self._mcache = None
         self.strings = None    # StringTables when localized and found
         self.structure_changed = True   # False after load; set by add/remove
+
+    @property
+    def header(self):
+        """The TES4 header record."""
+        h = self._header
+        if h is None:
+            raise EspError(f'{self.name}: this Plugin has no header - Plugin(name) does not read files. Use '
+                           'Plugin.load(path) to read a plugin, Plugin.load_header(path) for its header only, '
+                           'or Plugin.new(name) to start a new one')
+        return h
+
+    @header.setter
+    def header(self, rec):
+        self._header = rec
+        self._mcache = None
+
+    def _no_records(self, what):
+        self.header              # noqa: B018 - raises for Plugin(name) without a header
+        if self.header_only:
+            raise EspError(f'{self.name} was loaded with Plugin.load_header(), which reads only the header: '
+                           f'use Plugin.load(path) to {what}')
 
     # -- construction --------------------------------------------------------
     @classmethod
@@ -506,6 +643,37 @@ class Plugin:
         return p
 
     @classmethod
+    def load_header(cls, path, encoding=None):
+        """Read only the plugin header (TES4 record): masters, ESM/ESL/localized
+        flags, header version, next object ID, author, description. Reads a few
+        hundred bytes instead of the whole file, so checking the masters and flags
+        of a 1000-plugin load order takes well under a second. The result cannot
+        list records or be saved; use Plugin.load(path) for that."""
+        with open(path, 'rb') as f:
+            head = f.read(HEADER_SIZE)
+            if len(head) < HEADER_SIZE or head[:4] != b'TES4':
+                raise EspError(f'{path}: not a TES4-format plugin (Skyrim/Fallout 4 family)')
+            _, size, flags, formid, vc1, version, vc2 = REC_HDR.unpack_from(head, 0)
+            data = f.read(size)
+        if len(data) < size:
+            raise EspError(f'{path}: truncated file (the plugin header is cut off)')
+        p = cls(os.path.basename(path))
+        p.path = os.path.abspath(path)
+        if encoding:
+            p.encoding = encoding
+        hdr = Record('TES4', formid, flags, None, version, vc1, vc2)
+        hdr._raw = data
+        hdr._subs = None
+        hdr.plugin = p
+        p.header = hdr
+        hedr = hdr.get('HEDR')
+        if hedr is None or len(hedr.data) < 12:
+            raise EspError(f'{path}: TES4 header has no HEDR (Oblivion/Morrowind plugins are not supported)')
+        p.header_only = True
+        p.structure_changed = False
+        return p
+
+    @classmethod
     def new(cls, name, masters=(), esm=False, esl=False, author='', description='',
             hedr_version=1.7, next_object_id=0x800):
         p = cls(os.path.basename(name))
@@ -528,6 +696,17 @@ class Plugin:
     def masters(self):
         return [s.data.split(b'\0', 1)[0].decode(self.encoding, errors='replace')
                 for s in self.header.subrecords if s.sig == 'MAST']
+
+    def _master_list(self):
+        """self.masters, cached for per-record FormID lookups (a plugin with 250
+        masters takes ~0.2 ms per .masters call). Reset by add_master(),
+        set_masters() and invalidate(); call invalidate() after editing MAST
+        subrecords by hand."""
+        subs = self.header.subrecords
+        c = self._mcache
+        if c is None or c[0] is not subs or c[1] != len(subs):
+            c = self._mcache = (subs, len(subs), self.masters)
+        return c[2]
 
     @property
     def self_index(self):
@@ -587,7 +766,18 @@ class Plugin:
 
     @property
     def is_esl(self):
+        """The ESL flag is set (see is_light for what the game does)."""
         return bool(self.header.flags & FLAG_ESL)
+
+    @property
+    def is_light(self):
+        """Loads as a light plugin (FE slot): ESL flag or .esl extension."""
+        return self.is_esl or self.name.lower().endswith('.esl')
+
+    @property
+    def is_master_like(self):
+        """Loads in the master block: ESM flag, or .esm/.esl extension."""
+        return self.is_esm or self.name.lower().endswith(('.esm', '.esl'))
 
     @property
     def is_localized(self):
@@ -611,6 +801,7 @@ class Plugin:
         subs[idx:idx] = [Subrecord('MAST', name.encode(self.encoding) + b'\0'),
                          Subrecord('DATA', b'\0' * 8)]
         self.header.touched()
+        self._mcache = None
         return len(self.masters) - 1
 
     def set_masters(self, names):
@@ -627,12 +818,13 @@ class Plugin:
         subs[idx:idx] = block
         self.header._subs = subs
         self.header.touched()
+        self._mcache = None
 
     # -- FormID helpers -------------------------------------------------------
     def formid_owner(self, formid):
         """Name of the plugin that defines this (file-local) FormID."""
         idx = formid >> 24
-        ms = self.masters
+        ms = self._master_list()
         if idx < len(ms):
             return ms[idx]
         if idx == len(ms):
@@ -640,7 +832,33 @@ class Plugin:
         return None
 
     def is_override(self, rec):
-        return (rec.formid >> 24) < self.self_index
+        return (rec.formid >> 24) < len(self._master_list())
+
+    def formkey(self, formid):
+        """FormKey (object ID, defining plugin) of a FormID as stored in this
+        plugin - a record's .formid or a FormID value inside a field. Equal for
+        the same record in any plugin. None for 0 or an invalid master index."""
+        if not formid:
+            return None
+        owner = self.formid_owner(formid)
+        return FormKey(formid, owner) if owner is not None else None
+
+    def local_formid(self, key):
+        """The FormID this plugin uses for a record: key is a FormKey, an
+        (object ID, plugin name) pair or text like '012EB7:Skyrim.esm'.
+        None when the defining plugin is neither this one nor one of its masters."""
+        if isinstance(key, str):
+            key = FormKey.parse(key)
+        objid, owner = key
+        if not 0 <= objid <= 0xFFFFFF:
+            raise EspError(f'object ID {objid:#x} is out of range: a FormKey has a 6-digit object ID')
+        owner = owner.lower()
+        if owner == self.name.lower():
+            return (len(self._master_list()) << 24) | (objid & 0xFFFFFF)
+        for i, m in enumerate(self._master_list()):
+            if m.lower() == owner:
+                return (i << 24) | (objid & 0xFFFFFF)
+        return None
 
     # -- traversal -------------------------------------------------------------
     @property
@@ -653,6 +871,7 @@ class Plugin:
             types = {types}
         elif types is not None:
             types = set(types)
+        self._no_records('list its records')
         for r in self.root.records():
             if types is None or r.sig in types:
                 yield r
@@ -678,30 +897,41 @@ class Plugin:
 
     def index(self):
         if self._index is None:
-            self._index = {}
+            idx = {}
             for r in self.records():
-                self._index.setdefault(r.formid, r)
+                idx.setdefault(r.formid, r)
+            self._index = idx
         return self._index
 
     def edid_index(self):
         if self._edid_index is None:
-            self._edid_index = {}
+            idx = {}
             for r in self.records():
                 e = r.edid
                 if e:
-                    self._edid_index.setdefault(e.lower(), r)
+                    idx.setdefault(e.lower(), r)
+            self._edid_index = idx
         return self._edid_index
 
     def invalidate(self, structure=True):
         self._index = None
         self._edid_index = None
+        self._mcache = None
         if structure:
             self.structure_changed = True
 
     def find(self, formid):
+        """Record by FormID as stored in this plugin, or by FormKey (a record
+        from another plugin: plugin.find(other_record.formkey))."""
+        self._no_records('look up its records')
+        if isinstance(formid, (tuple, str)):
+            formid = self.local_formid(formid)
+            if formid is None:
+                return None
         return self.index().get(formid)
 
     def find_edid(self, edid):
+        self._no_records('look up its records')
         return self.edid_index().get(edid.lower())
 
     # -- structure edits ---------------------------------------------------
@@ -726,6 +956,7 @@ class Plugin:
         self.set_hedr(num_records=n_rec + n_grp)
 
     def to_bytes(self):
+        self._no_records('write it (saving a header-only plugin would drop every record)')
         if self.structure_changed:
             self.update_header_counts()
         out = bytearray()

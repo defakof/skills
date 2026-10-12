@@ -33,7 +33,9 @@ safely. Ask things like:
   xEdit-style disable for references), `merge` (Bashed-patch-style 3-way merge of leveled lists,
   inventories, keywords and changed fields), `conflicts`, `diff`, `itm`, `masters`, `esl`,
   `compact`, `delocalize`, `verify`, `schema`, `tree`, `strings`, `bsa`.
-- Whole-load-order analysis (plugins, not archives): `loadorder` (reads plugins.txt or an MO2
+- Whole-load-order analysis (plugins, not archives): `check-order` (instant check from plugin
+  headers only: missing or inactive masters, plugins loading before their masters, 254/4096
+  limits; exit code 1 on errors), `loadorder` (reads plugins.txt or an MO2
   profile; applies the game's rules - hardcoded and Creation Club plugins, masters first,
   hoisting, 254/4096 slots, header 1.71 vs game version - and LOOT's masterlist and userlist
   rules, groups, dirty-plugin CRCs and warnings; suggests the smallest set of moves and explains
@@ -43,7 +45,8 @@ safely. Ask things like:
   Synthesis (Fusion Patcher), NPC Plugin Chooser 2 / EasyNPC, Creation Kit, Mator Smash as a
   last resort) and `eslify` (flag-only vs compaction candidates and what compaction would break).
   Header scans are cached, so a 1,000-plugin load order rescans in seconds.
-- `scripts/esplib/`: the library behind it, usable from Python for bulk edits.
+- `scripts/esplib/`: the library behind it, usable from Python for bulk edits; header-only
+  loading (`Plugin.load_header`) for fast audits and FormKeys to match records across plugins.
 - Field layouts for 115 Skyrim SE record types (weapons, armor, NPCs, leveled lists, recipes,
   containers, spells, effects, perks, cells, references, worldspaces, dialogue, quests...), Papyrus
   script properties (VMAD), and conditions (CTDA) with all ~400 condition functions.
@@ -130,6 +133,7 @@ python $esp set MyMod.esp IronSword DATA.damage=12 KWDA+=WeapMaterialSteel
 python $esp conflicts ModA.esp ModB.esp --details
 python $esp merge ModA.esp ModB.esp --into "ModA - ModB Patch.esp"
 python $esp esl MyPatch.esp --flag
+python $esp check-order --mo2 "D:/MO2/profiles/Default"
 python $esp loadorder --mo2 "D:/MO2/profiles/Default" --groups
 python $esp scan --plugins-txt "%LOCALAPPDATA%/Skyrim Special Edition/Plugins.txt" --data "D:/Skyrim Special Edition/Data" --deep
 python $esp eslify --mo2 "D:/MO2/profiles/Default" --configs

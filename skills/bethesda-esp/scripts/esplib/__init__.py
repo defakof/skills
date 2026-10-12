@@ -11,9 +11,13 @@ Quick use from Python:
         print(rec.edid, [ (d.sig, d.value) for d in decode_record(rec) ])
     ops.apply_edits(lo, p, p.find_edid('MySword'), [('DATA.damage', '=', '20')])
     p.save()          # writes MyMod.esp (MyMod.esp.bak keeps the original)
+
+    h = Plugin.load_header('Some.esp')     # header only: .masters, .is_light, ... (fast)
+    a, b = Plugin.load('A.esp'), Plugin.load('B.esp')
+    both = {r.formkey for r in a.records('REFR')} & {r.formkey for r in b.records('REFR')}
 """
 
-from .core import (Plugin, Record, Group, Subrecord, EspError, record_context,
+from .core import (Plugin, Record, Group, Subrecord, EspError, FormKey, record_context,
                    FLAG_ESM, FLAG_ESL, FLAG_LOCALIZED, FLAG_DELETED, FLAG_COMPRESSED,
                    FLAG_INITIALLY_DISABLED, FLAG_PERSISTENT)
 from .codec import FormID, LStr, format_formid
@@ -22,7 +26,7 @@ from .loadorder import LoadOrder, lookup_record
 from .strings import StringTables, BSA
 from . import ops
 
-__all__ = ['Plugin', 'Record', 'Group', 'Subrecord', 'EspError', 'record_context',
+__all__ = ['Plugin', 'Record', 'Group', 'Subrecord', 'EspError', 'FormKey', 'record_context',
            'FormID', 'LStr', 'format_formid', 'decode_record', 'encode_items',
            'record_to_json', 'json_items', 'LoadOrder', 'lookup_record', 'StringTables',
            'BSA', 'ops', 'FLAG_ESM', 'FLAG_ESL', 'FLAG_LOCALIZED', 'FLAG_DELETED',
