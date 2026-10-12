@@ -277,6 +277,9 @@ def _check_list_file(what, path):
     """Refuse a plugin file or a file without plugin lines given as plugins.txt/loadorder.txt."""
     with open(path, 'rb') as f:
         head = f.read(4)
+    if head[:2] in (b'\xff\xfe', b'\xfe\xff'):
+        raise EspError(f'{path} is saved as UTF-16; Skyrim SE reads plugins.txt as Windows-1252 (ANSI) and would '
+                       'load none of these plugins. Save it as ANSI/UTF-8 or let the mod manager rewrite it')
     if head == b'TES4':
         raise EspError(f'{path} is a plugin, not a {what[2:].replace("-txt", ".txt")}: to check a list of plugin '
                        'files, give them without an option')

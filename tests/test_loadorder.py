@@ -1134,6 +1134,16 @@ class TestCheckOrder(LoBase):
         with open(ml, 'w') as f:
             f.write('# managed by MO2\n+Some Mod\n-Other Mod\n')
         bad['modlist.txt'] = ml
+        u16 = os.path.join(self.tmp, 'co_utf16.txt')
+        with open(u16, 'wb') as f:
+            f.write('*ModA.esp\r\n'.encode('utf-16'))
+        bad['UTF-16 plugins.txt'] = u16
+        for text in ('', '# only a comment\n', '\ufeff*ModA.esp\n'):              # still fine
+            ok = os.path.join(self.tmp, 'co_ok.txt')
+            with open(ok, 'w', encoding='utf-8') as f:
+                f.write(text)
+            r = self.run_cli('check-order', '--data', self.data, '--plugins', ok)
+            self.assertIn(r.returncode, (0, 1), (text, r.stderr))
         for what, path in bad.items():
             r = self.run_cli('check-order', '--data', self.data, '--plugins', path)
             self.assertEqual(r.returncode, 2, (what, r.stdout))
