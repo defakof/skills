@@ -651,7 +651,7 @@ class Evaluator:
         if parts:
             # only folders that have the first path component (each folder is listed once)
             first = parts[0].lower()
-            key = (id(roots), first)
+            key = ('data' if roots is self.data_dirs else 'game', first)
             if key not in self._first:
                 self._first[key] = [r for r in roots if first in self._listdir(r)]
             roots = self._first[key]
@@ -1047,8 +1047,10 @@ def update_snapshot(src=None):
         doc = parse_yaml_text(text)
     except Exception as ex:  # noqa: BLE001 - yaml.YAMLError etc.
         raise RuntimeError(f'{source} is not valid YAML: {ex}')
-    if not isinstance(doc, dict) or not isinstance(doc.get('plugins'), list):
-        raise RuntimeError(f'{source} does not look like a LOOT masterlist (no "plugins" list)')
+    if not isinstance(doc, dict) or not isinstance(doc.get('plugins'), list) or not doc['plugins'] \
+            or not isinstance(doc.get('groups'), list) or not doc['groups']:
+        raise RuntimeError(f'{source} does not look like a LOOT masterlist (it needs "groups" and "plugins" '
+                           'lists); the current copy was kept')
     data = compact_metadata(doc, source=source)
     os.makedirs(_cache_root(), exist_ok=True)
     out = updated_snapshot_path()

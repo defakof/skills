@@ -254,6 +254,25 @@ def _mo2_ini_paths(profile_dir):
     return game, mods, overwrite
 
 
+def mo2_dirs(profile_dir, mods_dir=None):
+    """(game Data folder or None, [(folder, label)] in MO2 priority order:
+    Overwrite, then enabled mods from highest to lowest priority)."""
+    prof = os.path.abspath(profile_dir)
+    game, mods, overwrite = _mo2_ini_paths(prof)
+    mods_dir = mods_dir or mods
+    dirs = []
+    modlist = os.path.join(prof, 'modlist.txt')
+    if os.path.isfile(modlist) and mods_dir and os.path.isdir(mods_dir):
+        if overwrite and os.path.isdir(overwrite):
+            dirs.append((overwrite, 'Overwrite'))
+        for mod, enabled in reversed(read_mo2_modlist(modlist)):
+            if enabled:
+                d = os.path.join(mods_dir, mod)
+                if os.path.isdir(d):
+                    dirs.append((d, mod))
+    return game, dirs
+
+
 def _ver_str(v):
     return '.'.join(str(x) for x in v) if v else '?'
 
@@ -316,6 +335,7 @@ class LoadOrderModel:
         self.is_vr = False         # SkyrimVR.exe next to the Data folder
         self.source_desc = ''
         self.manager = None        # 'MO2' | 'Vortex' | None
+        self.mo2_profile = None
         self.issues = []
         self.ccc = []
         self.ccc_source = None
@@ -345,18 +365,10 @@ class LoadOrderModel:
                     hint = ' - profiles there: ' + ', '.join(sorted(os.listdir(profs))[:10])
                 raise EspError(f'{prof} is not an MO2 profile folder (expected <MO2>/profiles/<name> with a '
                                f'plugins.txt){hint}')
-            game, mods, overwrite = _mo2_ini_paths(prof)
+            game, dirs = mo2_dirs(prof, mods_dir)
             data = data or game
-            mods_dir = mods_dir or mods
-            modlist = os.path.join(prof, 'modlist.txt')
-            if os.path.isfile(modlist) and mods_dir and os.path.isdir(mods_dir):
-                if overwrite and os.path.isdir(overwrite):
-                    lo.search_dirs.append((overwrite, 'Overwrite'))
-                for mod, enabled in reversed(read_mo2_modlist(modlist)):
-                    if enabled:
-                        d = os.path.join(mods_dir, mod)
-                        if os.path.isdir(d):
-                            lo.search_dirs.append((d, mod))
+            lo.search_dirs += dirs
+            lo.mo2_profile = prof
             pt = os.path.join(prof, 'plugins.txt')
             lt = os.path.join(prof, 'loadorder.txt')
             plugins_txt = plugins_txt or (pt if os.path.isfile(pt) else None)

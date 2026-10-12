@@ -38,8 +38,19 @@ def say(*a):
 # ---------------------------------------------------------------------------
 
 def make_lo(args):
-    lo = LoadOrder(getattr(args, 'data', None), getattr(args, 'encoding', None),
-                   getattr(args, 'lang', 'english'))
+    data = getattr(args, 'data', None)
+    prof = getattr(args, 'mo2', None)
+    dirs = []
+    if prof:
+        if not os.path.isdir(prof):
+            raise EspError(f'MO2 profile folder not found: {prof}')
+        game, mo2 = lorder.mo2_dirs(prof, getattr(args, 'mods', None))
+        data = data or game
+        dirs = [d for d, _label in mo2]
+    lo = LoadOrder(data, getattr(args, 'encoding', None), getattr(args, 'lang', 'english'))
+    if dirs:
+        # MO2's virtual Data folder: Overwrite, then mods by priority, then the real Data
+        lo.data_dirs = dirs + lo.data_dirs
     return lo
 
 
@@ -62,6 +73,9 @@ def save(plugin, args, default_path=None):
         backup = False
     if os.path.basename(out).lower() != plugin.name.lower():
         plugin.name = os.path.basename(out)
+    parent = os.path.dirname(os.path.abspath(out))
+    if not os.path.isdir(parent):
+        os.makedirs(parent)              # e.g. a new MO2 mod folder for a patch
     path = plugin.save(out, backup=backup)
     say(f'wrote {path}' + (f' (backup: {path}.bak*)' if backup and os.path.exists(path + '.bak') else ''))
     return path
@@ -1256,6 +1270,7 @@ def cmd_scan(args):
     order = model.effective_order()
     n_full = sum(1 for e in order if not model.is_light(e))
     esl = eslify_mod.analyse(model, configs=True)
+    advice.set_context(model)
     over = sc.overridden_patches(confl)
     if args.deep:
         # keep only records where the deep comparison shows the patch actually loses something
@@ -1342,6 +1357,9 @@ def cmd_scan(args):
         say(f'... {len(adv) - args.limit} more (raise --limit or use --json)')
     if not args.deep and confl:
         say('Run with --deep to compare field by field and see exactly whose changes are lost.')
+    if model.mo2_profile and adv:
+        say('MO2: the suggested commands include --mo2 so they find plugins in your mod folders; create new '
+            'patches inside a new mod folder (e.g. --into "<mods>/My Patch/Patch.esp") and enable that mod.')
 
 
 def cmd_eslify(args):
@@ -1413,6 +1431,8 @@ def build_parser():
     common.add_argument('--data', help='game Data folder (to find masters, strings, BSAs)')
     common.add_argument('--encoding', help='text encoding of plugin strings (default cp1252)')
     common.add_argument('--lang', default='english', help='strings language (default english)')
+    common.add_argument('--mo2', help='Mod Organizer 2 profile folder: find plugins, masters, strings and BSAs '
+                        'in its enabled mods (by priority) as the game sees them')
     write = argparse.ArgumentParser(add_help=False)
     write.add_argument('-o', '--output', help='write to this file instead of in place')
     write.add_argument('--no-backup', action='store_true', help='do not keep a .bak when writing in place')
@@ -1592,7 +1612,6 @@ def build_parser():
     lo_src.add_argument('plugins', nargs='*', help='plugin files/names in load order (instead of a plugins.txt)')
     lo_src.add_argument('--plugins-txt', help='plugins.txt (Steam: %%LOCALAPPDATA%%\\Skyrim Special Edition\\plugins.txt)')
     lo_src.add_argument('--loadorder-txt', help='loadorder.txt with the full order (LOOT / MO2 / Wrye Bash)')
-    lo_src.add_argument('--mo2', help='Mod Organizer 2 profile folder (reads plugins.txt, loadorder.txt, modlist.txt)')
     lo_src.add_argument('--mods', help='MO2 mods folder (default: from ModOrganizer.ini)')
     lo_src.add_argument('--ccc', help='Skyrim.ccc (default: next to the Data folder)')
     lo_src.add_argument('--no-cache', action='store_true', help='rescan every plugin (ignore the scan cache)')

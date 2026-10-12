@@ -7,6 +7,7 @@
 | `--data DIR` | game `Data` folder: where masters, `Strings/` and BSAs are looked up (the plugin's own folder is always searched) |
 | `--encoding ENC` | code page of non-localized text (default `cp1252`; e.g. `cp1251` for Russian, `utf-8`). Env: `ESP_ENCODING` |
 | `--lang NAME` | strings language for localized plugins (default `english` -> `Skyrim_english.STRINGS`) |
+| `--mo2 PROFILE_DIR` | Mod Organizer 2 profile folder: plugins, masters, strings and BSAs are found in its enabled mods by priority (Overwrite first), then the game's Data folder from ModOrganizer.ini - like the game sees them through MO2 |
 
 Commands that write also accept `-o OUT` (write a new file instead of in place),
 `--no-backup` (no `.bak` when writing in place) and `--dry-run`.

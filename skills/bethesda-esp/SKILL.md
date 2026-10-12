@@ -34,7 +34,9 @@ the plugin that defines it; master-order independent, preferred) or **file-local
    found. Masters next to the plugin are found automatically.
 4. Before editing a record, `esp show` it. After writing, re-`show` it (or `esp verify file`) to confirm.
 5. If the user's mod manager is MO2, plugins live in `mods/<ModName>/` and the load order in
-   `profiles/<Profile>/plugins.txt`; pass the files you need (or `--data` to the real Data folder).
+   `profiles/<Profile>/plugins.txt`: add `--mo2 "<MO2>/profiles/<Profile>"` to any command and plugin
+   names are found in the enabled mods by priority (as the game sees them). Put new patches in a new
+   mod folder (`--into "<MO2>/mods/My Patch/My Patch.esp"`) and tell the user to enable that mod.
 6. Placed references (REFR/ACHR) from masters must not be *deleted* (crash risk) - use
    `esp delete --disable` (undelete + initially disabled + moved below the world, as xEdit does).
 7. New records in an ESL-flagged plugin need object IDs 0x800-0xFFF (0x001-0xFFF with header 1.71,

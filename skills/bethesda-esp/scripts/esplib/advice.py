@@ -36,6 +36,24 @@ TOOLS = {
 
 PRIORITY_NAMES = {1: 'critical', 2: 'high', 3: 'medium', 4: 'low'}
 
+# Options appended to suggested esp commands so they find the plugins as the game
+# does (MO2 mod folders or the Data folder). Set by set_context().
+_CTX = ''
+
+
+def set_context(model):
+    """Make suggested commands carry --mo2 / --data for this load order."""
+    global _CTX
+    if model is None:
+        _CTX = ''
+    elif getattr(model, 'mo2_profile', None):
+        _CTX = f' --mo2 "{model.mo2_profile}"'
+    elif getattr(model, 'data_dir', None):
+        _CTX = f' --data "{model.data_dir}"'
+    else:
+        _CTX = ''
+    return _CTX
+
 
 class Advice:
     def __init__(self, priority, kind, title, why, how=None, tools=None, plugins=None, records=None):
@@ -177,9 +195,9 @@ def from_overridden_patches(over):
                           'A compatibility patch only works where its records win; here a later plugin that does '
                           'not include the patch\'s changes overrides it.',
                           [f'If {winner} does not need to win those records, load {patch} after it.',
-                           'Otherwise make a small patch on top of both: esp merge {} {} --into "Patch.esp" {}{}'
-                           .format(_q(patch), _q(winner), *_records_arg([c.formkey for c in cs],
-                                                                         {c.sig for c in cs}))],
+                           'Otherwise make a small patch on top of both: esp merge {} {} --into "Patch.esp"{} {}{}'
+                           .format(_q(patch), _q(winner), _CTX, *_records_arg([c.formkey for c in cs],
+                                                                              {c.sig for c in cs}))],
                           ['esp-merge', 'xedit'], [patch, winner], [f'{c.sig} {c.formkey}' for c in cs]))
     return out
 
@@ -299,7 +317,7 @@ def _how(cat, cs, plugins, deep, tags=None):
         if d.get('npc'):
             npc_kind.add(d['npc'])
     lost = _lost_entries(cs)
-    merge_cmd = f'esp merge {pl} --into "Patch.esp" {recs}{recs_note}'
+    merge_cmd = f'esp merge {pl} --into "Patch.esp"{_CTX} {recs}{recs_note}'
     if cat == 'navmesh':
         return (['Not auto-mergeable (the Bashed Patch, Smash and Synthesis mergers all skip navmeshes). Use the '
                  'navmesh patch from the mod pages if one exists; otherwise choose the winner by load order or '
@@ -309,8 +327,8 @@ def _how(cat, cs, plugins, deep, tags=None):
     if cat == 'quests':
         return (['Quests, dialogue, scenes and AI packages carry scripts (VMAD) and conditions that no automatic '
                  'tool merges: use the authors\' compatibility patch if there is one.',
-                 f'Otherwise compare (esp conflicts {pl} --details) and patch by hand: esp copy <winner> <record> '
-                 '--to Patch.esp --create, then forward the other mod\'s changes with esp set (or in SSEEdit).'],
+                 f'Otherwise compare (esp conflicts {pl} --details{_CTX}) and patch by hand: esp copy <winner> '
+                 f'<record> --to Patch.esp --create{_CTX}, then forward the other mod\'s changes with esp set (or in SSEEdit).'],
                 ['xedit', 'esp-copy'])
     if cat == 'leveled':
         steps = ['Build a Bashed Patch (Wrye Bash 315+, Leveled Lists): the standard merge for leveled lists; LOOT '
@@ -374,8 +392,8 @@ def _how(cat, cs, plugins, deep, tags=None):
                 ['esp-merge', 'bashed', 'xedit'])
     if cat == 'settings':
         return (['Only one value can win: the last plugin decides. Reorder if you prefer the other value, or set '
-                 'it in a patch (esp copy <winner> <record> --to Patch.esp --create; esp set Patch.esp <record> '
-                 'DATA=<value>).'],
+                 f'it in a patch (esp copy <winner> <record> --to Patch.esp --create{_CTX}; esp set Patch.esp '
+                 f'<record> DATA=<value>{_CTX}).'],
                 ['esp-copy'])
     if cat == 'placed':
         return (['Usually fine to let load order decide (one mod moves or edits the object). If one mod deletes '
@@ -417,7 +435,7 @@ def from_checks(dirty, navcells, edid_dups, collisions, reverts, scanner):
                               'Deleted references (UDRs) can crash the game when other mods or scripts touch them.',
                               [f'Run SSEEdit Quick Auto Clean on {name} alone (only its masters loaded); first '
                                'check LOOT\'s messages for it - a few plugins must not be cleaned.',
-                               f'Or fix them here: esp delete {_q(name)} {" ".join(d.get("refs", [])[:8])} --disable '
+                               f'Or fix them here: esp delete {_q(name)} {" ".join(d.get("refs", [])[:8])} --disable{_CTX} '
                                '(restores each reference from its master, then undeletes and disables it the way '
                                'xEdit does).'],
                               ['qac'], [name]))
@@ -433,7 +451,7 @@ def from_checks(dirty, navcells, edid_dups, collisions, reverts, scanner):
         out.append(Advice(4, 'editor-id', f'EditorID "{edid}" is used by different records in {", ".join(plugins)}',
                           'Duplicate EditorIDs confuse tools that look records up by EditorID (SPID/KID configs, '
                           'console, xEdit scripts); usually harmless in game.',
-                          ['Rename the EditorID in the less important plugin (esp set <plugin> <record> EDID=NewName) '
+                          [f'Rename the EditorID in the less important plugin (esp set <plugin> <record> EDID=NewName{_CTX}) '
                            'if a config refers to it.'], [], plugins))
     for key, names, sigs in collisions:
         out.append(Advice(1, 'injected-collision', f'{", ".join(names)} all inject record {key}',
@@ -462,8 +480,8 @@ def from_checks(dirty, navcells, edid_dups, collisions, reverts, scanner):
                           '(esp scan --deep shows which fields).',
                           ([f'Look for a USSEP-compatible version or patch of {plugin} on its mod page.']
                            if unofficial else []) +
-                          ['Forward the fixes into a patch that loads after {}: esp merge {} {} --into "Patch.esp" '
-                           '{}{}'.format(plugin, ' '.join(_q(f) for f in fixers), _q(plugin),
+                          ['Forward the fixes into a patch that loads after {}: esp merge {} {} --into "Patch.esp"{} '
+                           '{}{}'.format(plugin, ' '.join(_q(f) for f in fixers), _q(plugin), _CTX,
                                          *_records_arg([scanner.formkey(k) for k in keys],
                                                        {scanner.versions[k][0].sig for k in keys}))],
                           ['esp-merge', 'xedit'], [plugin] + list(fixers)))
@@ -488,8 +506,8 @@ def from_eslify(cands, n_full, max_full=254, steps=None):
     room = f'{n_full} of {max_full} full slots used' + (f'; at least {need} must go' if need else '')
     steps = steps or []
     if flag or flag171:
-        cmds = [f'esp esl {_q(c.entry.name)} --flag' for c in flag[:15]] + \
-               [f'esp esl {_q(c.entry.name)} --header-171 --flag' for c in flag171[:10]]
+        cmds = [f'esp esl {_q(c.entry.name)} --flag{_CTX}' for c in flag[:15]] + \
+               [f'esp esl {_q(c.entry.name)} --header-171 --flag{_CTX}' for c in flag171[:10]]
         more = len(flag) + len(flag171) - len(cmds)
         out.append(Advice(prio, 'eslify-flag',
                           f'{len(flag) + len(flag171)} plugin(s) can be ESL-flagged without changing FormIDs',

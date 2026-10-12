@@ -992,3 +992,42 @@ class TestReviewRound2(LoBase):
         self.assertLess(time.time() - t, 10)
         self.assertEqual(len(moves), n - 1)
         self.assertTrue(all(r for _e, r in moves))
+
+
+class TestMo2Commands(LoBase):
+    def test_commands_resolve_through_mo2(self):
+        """Every command takes --mo2; scan's suggested commands carry it and run as printed."""
+        root = os.path.join(self.tmp, 'mo2cmd')
+        game = os.path.join(root, 'Game')
+        gdata = os.path.join(game, 'Data')
+        os.makedirs(gdata)
+        shutil.copy(os.path.join(self.root, 'Skyrim.ccc'), game)
+        mods = os.path.join(root, 'MO2', 'mods')
+        prof = os.path.join(root, 'MO2', 'profiles', 'Main Profile')
+        os.makedirs(prof)
+        modnames = []
+        for n in sorted(os.listdir(self.data)):
+            if n.lower() in ('skyrim.esm', 'update.esm', 'cctestsse001-example.esl'):
+                shutil.copy(os.path.join(self.data, n), gdata)
+            elif n.lower().endswith(('.esp', '.esm', '.esl')):
+                mod = 'Mod - ' + os.path.splitext(n)[0]
+                os.makedirs(os.path.join(mods, mod))
+                shutil.copy(os.path.join(self.data, n), os.path.join(mods, mod))
+                modnames.append(mod)
+        with open(os.path.join(root, 'MO2', 'ModOrganizer.ini'), 'w') as f:
+            f.write('[General]\ngamePath=@ByteArray(%s)\n' % game.replace('\\', '\\\\'))
+        with open(os.path.join(prof, 'modlist.txt'), 'w') as f:
+            f.write(''.join('+%s\n' % m for m in reversed(modnames)))
+        shutil.copy(self.ptxt, os.path.join(prof, 'plugins.txt'))
+        out = self.cli('scan', '--mo2', prof, '--deep')
+        cmd = [line.strip() for line in out.splitlines() if 'esp merge Update.esm Reverter.esp' in line][0]
+        cmd = cmd[cmd.index('esp merge'):].split(' (')[0]
+        self.assertIn('--mo2', cmd)
+        import shlex
+        args = shlex.split(cmd)[1:]
+        args[args.index('Patch.esp')] = os.path.join(mods, 'My Patch', 'Patch.esp')
+        self.cli(*args)
+        self.assertTrue(os.path.isfile(os.path.join(mods, 'My Patch', 'Patch.esp')))
+        shown = self.cli('show', os.path.join(mods, 'My Patch', 'Patch.esp'), 'FoodApple', '--mo2', prof)
+        self.assertIn('value=4', shown)
+        self.assertIn('weight=0.2', shown)
