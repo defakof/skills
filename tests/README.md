@@ -22,3 +22,14 @@ implementation instead of against itself.
 | `bsa/LocMaster.esm` + `bsa/Skyrim - Interface.bsa` | same master, strings only inside an SE (v105, LZ4) BSA built by `tools/make_test_bsa.py` and checked with Mutagen's archive reader |
 
 `tools/make_test_bsa.py` needs `pip install lz4` (only to rebuild the BSA fixture).
+
+## Load-order scenario
+
+`test_loadorder.py` builds a small load order with `tools/make_lo_fixture.py` (stdlib + esplib)
+in a temp folder: base-game masters with real names, USSEP, two conflicting mods and their patch,
+a generated Bashed Patch listed too early, light plugins (one invalid), ESL candidates (one with
+an NPC, a dependent plugin and a SPID config), an LE plugin, missing/inactive masters, a plugin
+loaded before its master, a dirty plugin (ITM, deleted reference, deleted navmesh), duplicate
+EditorIDs, injected records, a master that needs a regular plugin (hoisting), a patch overridden
+by a later plugin, a plugin reverting an Update.esm fix, a Skyrim.ccc and a plugins.txt.
+`python tests/tools/make_lo_fixture.py <dir>` writes it out to look at.

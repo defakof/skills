@@ -23,6 +23,8 @@ from esplib.fields import (decode_record, record_to_json, json_items, encode_ite
                            to_jsonable, describe_spec, record_def, dumps)
 from esplib.loadorder import LoadOrder, lookup_record, read_plugins_txt            # noqa: E402
 from esplib import schema_sse as schema                                            # noqa: E402
+from esplib import lorder, conflicts as conflicts_mod, eslify as eslify_mod, advice   # noqa: E402
+from esplib import masterlist as masterlist_mod                                    # noqa: E402
 
 OUT = sys.stdout
 
@@ -36,8 +38,19 @@ def say(*a):
 # ---------------------------------------------------------------------------
 
 def make_lo(args):
-    lo = LoadOrder(getattr(args, 'data', None), getattr(args, 'encoding', None),
-                   getattr(args, 'lang', 'english'))
+    data = getattr(args, 'data', None)
+    prof = getattr(args, 'mo2', None)
+    dirs = []
+    if prof:
+        if not os.path.isdir(prof):
+            raise EspError(f'MO2 profile folder not found: {prof}')
+        game, mo2 = lorder.mo2_dirs(prof, getattr(args, 'mods', None))
+        data = data or game
+        dirs = [d for d, _label in mo2]
+    lo = LoadOrder(data, getattr(args, 'encoding', None), getattr(args, 'lang', 'english'))
+    if dirs:
+        # MO2's virtual Data folder: Overwrite, then mods by priority, then the real Data
+        lo.data_dirs = dirs + lo.data_dirs
     return lo
 
 
@@ -60,6 +73,9 @@ def save(plugin, args, default_path=None):
         backup = False
     if os.path.basename(out).lower() != plugin.name.lower():
         plugin.name = os.path.basename(out)
+    parent = os.path.dirname(os.path.abspath(out))
+    if not os.path.isdir(parent):
+        os.makedirs(parent)              # e.g. a new MO2 mod folder for a patch
     path = plugin.save(out, backup=backup)
     say(f'wrote {path}' + (f' (backup: {path}.bak*)' if backup and os.path.exists(path + '.bak') else ''))
     return path
@@ -463,6 +479,9 @@ def cmd_delete(args):
     if args.mark or args.disable:
         for r in recs:
             if args.disable:
+                if r.flags & core.FLAG_DELETED and r.get('NAME') is None:
+                    src = ops.restore_from_masters(lo, p, r)
+                    say(f'restored fields of {r.label()} from {src}')
                 ops.undelete_and_disable(p, r)
                 say(f'disabled {header_line(lo, p, r)}')
             else:
@@ -718,6 +737,12 @@ def cmd_itm(args):
 def cmd_esl(args):
     lo = make_lo(args)
     p = load(lo, args.plugin)
+    if args.header_171:
+        p.set_hedr(version=1.71)
+        say('header version set to 1.71 (light range 001-FFF; needs Skyrim SE 1.6.1130+ or BEES)')
+        if not args.flag and not args.unflag:
+            save(p, args)
+            return
     rep = ops.esl_report(p)
     if args.flag:
         if not rep['eligible_as_is']:
@@ -980,6 +1005,414 @@ def cmd_bsa(args):
 
 
 # ---------------------------------------------------------------------------
+# load order / whole-load-order analysis
+# ---------------------------------------------------------------------------
+
+def load_model(args):
+    ml = getattr(args, 'masterlist', None)
+    return lorder.LoadOrderModel.from_sources(
+        plugins=args.plugins or None, data=args.data, plugins_txt=args.plugins_txt,
+        loadorder_txt=args.loadorder_txt, mo2_profile=args.mo2, mods_dir=args.mods, ccc=args.ccc,
+        use_cache=not args.no_cache, masterlist=ml, userlist=getattr(args, 'userlist', None),
+        use_metadata=not getattr(args, 'no_loot', False) and ml != 'none')
+
+
+def _flags_str(e):
+    s = e.scan
+    if s is None:
+        return 'missing' if not e.path else 'unreadable'
+    bits = []
+    if s.is_esm:
+        bits.append('ESM')
+    if s.is_esl_flag or s.ext == '.esl':
+        bits.append('ESL')
+    if s.is_localized:
+        bits.append('L')
+    return ','.join(bits) or 'ESP'
+
+
+def _print_issues(issues, limit=200, include_info=True):
+    order = {'error': 0, 'warning': 1, 'info': 2}
+    issues = sorted(issues, key=lambda i: (order[i.level], i.code, i.plugin or ''))
+    hidden = 0
+    if not include_info:
+        hidden = sum(1 for i in issues if i.level == 'info')
+        issues = [i for i in issues if i.level != 'info']
+    for i in issues[:limit]:
+        say(f'  {i.level.upper():7} [{i.code}] {i.message}')
+        if i.fix:
+            say(f'          fix: {i.fix}')
+    if len(issues) > limit:
+        say(f'  ... {len(issues) - limit} more (use --json)')
+    if hidden:
+        say(f'  ({hidden} note(s) hidden; --all shows them)')
+
+
+def _load_rules(path):
+    """--rules JSON: {"Plugin.esp": {"after": [...], "before": [...]}}."""
+    if not path:
+        return {}
+    try:
+        with open(path, encoding='utf-8-sig') as f:
+            data = json.load(f)
+    except (OSError, ValueError) as ex:
+        raise EspError(f'cannot read rules file {path}: {ex}')
+    if not isinstance(data, dict):
+        raise EspError(f'{path}: expected {{"Plugin.esp": {{"after": [...], "before": [...]}}}}')
+    out = {}
+    for name, r in data.items():
+        if not isinstance(r, dict):
+            raise EspError(f'{path}: the value for {name!r} must be an object with "after"/"before" lists')
+        rule = {}
+        for k in ('after', 'before', 'req'):
+            v = r.get(k, [])
+            v = [v] if isinstance(v, str) else v
+            if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+                raise EspError(f'{path}: {name}.{k} must be a list of plugin names')
+            rule[k] = v
+        out[name] = rule
+    return out
+
+
+def _written_order(model, order):
+    """[(entry, active)] for a plugins.txt: the given order without base-game and
+    Creation Club plugins, inactive or missing entries kept next to the plugin
+    they followed before."""
+    placed = [e for e in order if not e.implicit]
+    placed_low = {e.low for e in placed}
+    anchored = {}                 # lower name of preceding placed plugin (or None) -> [entries]
+    anchor = None
+    for e in sorted((x for x in model.entries if not x.implicit and x.listed is not None),
+                    key=lambda x: x.listed):
+        if e.low in placed_low:
+            anchor = e.low
+        else:
+            anchored.setdefault(anchor, []).append(e)
+    out = [(e, e.active) for e in anchored.get(None, [])]
+    for e in placed:
+        out.append((e, True))
+        out += [(x, x.active) for x in anchored.get(e.low, [])]
+    return out
+
+
+def write_plugins_txt(path, model, order):
+    """Write a Skyrim SE plugins.txt ('*' = active, Windows-1252, CRLF) for the
+    given order. Returns names that could not be encoded."""
+    lines = ['# This file is used by Skyrim to keep track of your downloaded content.',
+             '# Written by esp.py loadorder --write']
+    lines += [('*' if active else '') + e.name for e, active in _written_order(model, order)]
+    bad = []
+    for n in lines:
+        try:
+            n.encode('cp1252')
+        except UnicodeEncodeError:
+            bad.append(n.lstrip('*'))
+    with open(path, 'w', encoding='cp1252', errors='replace', newline='\r\n') as f:
+        f.write('\n'.join(lines) + '\n')
+    return bad
+
+
+def write_loadorder_txt(path, model, order):
+    """Write a loadorder.txt (UTF-8, every plugin including base game and
+    Creation Club, no '*'), the file MO2 reads its order from."""
+    names = [e.name for e in order if e.implicit] + [e.name for e, _a in _written_order(model, order)]
+    with open(path, 'w', encoding='utf-8', newline='\r\n') as f:
+        f.write('# This file was automatically generated by Mod Organizer.\n' if model.manager == 'MO2' else '')
+        f.write('\n'.join(names) + '\n')
+
+
+def _meta_desc(model):
+    if model.meta is None:
+        return model.meta_error or 'LOOT metadata off'
+    return '; '.join(model.meta.sources)
+
+
+def cmd_loadorder(args):
+    model = load_model(args)
+    issues = model.validate()
+    order = model.effective_order()
+    idx = model.load_indices(order)
+    n_light = sum(1 for e in order if model.is_light(e))
+    n_full = len(order) - n_light
+    max_full = model.max_full(order)
+    inactive = [e for e in model.entries if not e.active and not e.implicit]
+    rules = _load_rules(args.rules)
+    sorted_order, moves, notes = model.sort(rules=rules, use_overlap=not args.no_overlap,
+                                            use_groups=not args.no_groups)
+    bad_names = write_plugins_txt(args.write, model, sorted_order) if args.write else []
+    if args.write_loadorder:
+        write_loadorder_txt(args.write_loadorder, model, sorted_order)
+    groups = {e.low: model.group_of(e) for e in order} if model.meta else {}
+    if args.json:
+        say(dumps({
+            'source': model.source_desc,
+            'manager': model.manager,
+            'game_version': '.'.join(map(str, model.game_version)) if model.game_version else None,
+            'metadata': _meta_desc(model),
+            'counts': {'active': len(order), 'full': n_full, 'full_limit': max_full, 'light': n_light,
+                       'inactive': len(inactive), 'unlisted': len(model.unlisted)},
+            'effective_order': [{'index': idx[e.low], 'name': e.name, 'flags': _flags_str(e),
+                                 'implicit': e.implicit, 'listed': e.listed, 'source': e.source,
+                                 'group': groups.get(e.low),
+                                 'masters': e.scan.masters if e.scan else [],
+                                 'new_records': e.scan.n_new() if e.scan else None,
+                                 'overrides': e.scan.n_override() if e.scan else None,
+                                 'header_version': round(e.scan.hedr_version, 2) if e.scan else None}
+                                for e in order],
+            'issues': [i.as_dict() for i in issues],
+            'suggested_order': [e.name for e in sorted_order],
+            'moves': [{'plugin': e.name, 'reasons': list(dict.fromkeys(r))} for e, r in moves],
+            'notes': notes,
+            'written': [x for x in (args.write, args.write_loadorder) if x],
+        }))
+        return
+    say(f'Load order from {model.source_desc}' + (f' ({model.manager})' if model.manager else ''))
+    if model.game_version:
+        say(f'  game: SkyrimSE.exe {".".join(map(str, model.game_version))}')
+    say(f'  LOOT metadata: {_meta_desc(model)}')
+    say(f'  {len(order)} active plugins: {n_full} full (of {max_full} slots), {n_light} light (FE), '
+        f'{len(inactive)} inactive')
+    if not args.brief:
+        say('')
+        say('  idx    flags     new  ovrd  plugin')
+        for e in order:
+            s = e.scan
+            tag = f'  [{e.implicit}]' if e.implicit else ''
+            grp = f'  {{{groups[e.low]}}}' if args.groups and groups.get(e.low) not in (None, 'default') else ''
+            src = f'  <{e.source}>' if args.sources and e.source else ''
+            say(f'  {idx[e.low]:<6} {_flags_str(e):<8} {s.n_new() if s else "-":>5} {s.n_override() if s else "-":>5}  '
+                f'{e.name}{tag}{grp}{src}')
+    say('')
+    errs = [i for i in issues if i.level == 'error']
+    say(f'Problems: {len(errs)} error(s), {sum(1 for i in issues if i.level == "warning")} warning(s), '
+        f'{sum(1 for i in issues if i.level == "info")} note(s)')
+    _print_issues(issues, include_info=args.all)
+    say('')
+    if moves:
+        say(f'Suggested changes ({len(moves)} plugin(s) move):')
+        for e, reasons in moves:
+            uniq = list(dict.fromkeys(reasons))
+            say(f'  move {e.name}')
+            for r in uniq[:3]:
+                say(f'       because {r}')
+        if args.full_order or args.write:
+            say('Suggested order:')
+            for i, e in enumerate(sorted_order):
+                say(f'  {i:3} {e.name}')
+    else:
+        say('Order looks right: no plugin needs to move for the rules this tool checks.')
+    for n in notes:
+        say(f'  note: {n}')
+    if args.write:
+        say(f'wrote {args.write}: review it, then (with the game and mod manager closed) replace the plugins.txt '
+            'it came from' + (', or apply the order in MO2/Vortex' if model.manager else ''))
+        if model.manager == 'MO2' and not args.write_loadorder:
+            say('  MO2 takes the order from the profile\'s loadorder.txt when it starts: also write it with '
+                '--write-loadorder, or the old order comes back')
+    if bad_names:
+        say(f'  warning: {len(bad_names)} name(s) are not Windows-1252 and were written with "?" (the game '
+            'cannot load them anyway; rename those plugins): ' + ', '.join(bad_names[:5]))
+    if args.write_loadorder:
+        say(f'wrote {args.write_loadorder} (loadorder.txt: every plugin, in the same order)')
+
+
+def cmd_loot_update(args):
+    try:
+        out, data = masterlist_mod.update_snapshot(args.source)
+    except (RuntimeError, ValueError) as ex:
+        raise EspError(str(ex))
+    except OSError as ex:
+        raise EspError(f'could not get the masterlist: {ex} (download it in a browser from '
+                       f'{masterlist_mod.MASTERLIST_URL} and pass the file)')
+    say(f'LOOT masterlist: {len(data["plugins"])} plugin entries, {len(data["groups"])} groups from {data["source"]}')
+    say(f'saved to {out}; loadorder/scan use it from now on')
+
+
+def cmd_scan(args):
+    import time
+    t0 = time.time()
+    model = load_model(args)
+    issues = model.validate()
+    sc = conflicts_mod.Scanner(model)
+    types = parse_types(args.type)
+    confl = sc.conflicts(only=args.only, types=types)
+    deep_done = 0
+    if args.deep:
+        lo = LoadOrder(model.data_dir, getattr(args, 'encoding', None), getattr(args, 'lang', 'english'))
+        for d, _ in model.search_dirs:
+            if d not in lo.data_dirs:
+                lo.data_dirs.append(d)
+        dc = conflicts_mod.DeepComparer(sc, lo)
+        for c in confl[:args.max_deep]:
+            try:
+                c.deep = dc.compare(c)
+            except (EspError, OSError) as ex:
+                c.deep = {'status': 'unknown', 'error': str(ex), 'losers': []}
+            deep_done += 1
+    dirty = sc.dirty()
+    navcells = sc.navmesh_cells()
+    edids = sc.edid_duplicates()
+    _inj, collisions = sc.injected()
+    collided = {k for k, _n, _t in collisions}
+    confl_adv = [c for c in confl if c.formkey not in collided]
+    reverts = sc.official_reverts()
+    if args.deep:
+        for plugin, d in reverts.items():
+            d['checked'] = True
+            for k in d['keys'][:args.max_deep]:
+                try:
+                    fl = dc.reverted_fields(k, d['fixers'])
+                except (EspError, OSError):
+                    fl = []
+                if fl:
+                    d['fields'][sc.formkey(k)] = fl
+    _sorted, moves, _notes = model.sort()
+    order = model.effective_order()
+    n_full = sum(1 for e in order if not model.is_light(e))
+    esl = eslify_mod.analyse(model, configs=True)
+    advice.set_context(model)
+    over = sc.overridden_patches(confl)
+    if args.deep:
+        # keep only records where the deep comparison shows the patch actually loses something
+        for k in list(over):
+            keep = [c for c in over[k] if c.deep is None or
+                    (c.deep.get('status') in ('lists', 'forwardable', 'clash') and
+                     any(l['plugin'] == k[0] for l in c.deep.get('losers', [])))]
+            if keep:
+                over[k] = keep
+            else:
+                del over[k]
+    adv = advice.from_validation(issues) + advice.from_sort(moves) + advice.from_overridden_patches(over) + \
+        advice.from_conflicts(confl_adv, deep=args.deep, scanner=sc) + \
+        advice.from_checks(dirty, navcells, edids, collisions, reverts, sc) + advice.from_eslify(
+            esl, n_full, model.max_full(order), eslify_mod.procedure(eslify_mod._game_supports_171(model)))
+    adv = advice.sort_advice(adv)
+    by_cat = {}
+    for c in confl:
+        by_cat[c.category] = by_cat.get(c.category, 0) + 1
+    statuses = {}
+    for c in confl:
+        if c.deep:
+            statuses[c.deep['status']] = statuses.get(c.deep['status'], 0) + 1
+    elapsed = time.time() - t0
+    if args.json:
+        say(dumps({
+            'source': model.source_desc, 'plugins': len(order), 'seconds': round(elapsed, 1),
+            'conflicts': {'total': len(confl), 'by_category': by_cat, 'deep_status': statuses,
+                          'deep_compared': deep_done},
+            'records': [{'record': f'{c.sig} {c.formkey}', 'category': c.category,
+                         'plugins': [v.entry.name for v in c.overriders], 'winner': c.winner.entry.name,
+                         'patched': c.patched, 'deep': c.deep} for c in confl[:args.limit_records]],
+            'dirty': dirty,
+            'navmesh_cells': [{'cell': k, 'plugins': [e.name for e in v]} for k, v in navcells],
+            'editor_id_duplicates': [{'edid': k, 'where': v} for k, v in edids],
+            'injected_collisions': [{'record': k, 'plugins': n, 'types': t} for k, n, t in collisions],
+            'reverted_fixes': [{'plugin': p, 'fixes_from': d['fixers'], 'records': [sc.formkey(k) for k in d['keys']],
+                                'reverted_fields': d['fields'] if args.deep else None} for p, d in reverts.items()],
+            'overridden_patches': [{'patch': p, 'winner': w, 'records': [f'{c.sig} {c.formkey}' for c in cs]}
+                                   for (p, w), cs in over.items()],
+            'recommendations': [a.as_dict() for a in adv],
+        }))
+        return
+    say(f'Scanned {len(order)} plugins from {model.source_desc} in {elapsed:.1f}s')
+    errs = [i for i in issues if i.level == 'error']
+    if errs:
+        say(f'  {len(errs)} load-order error(s) - see recommendations / esp loadorder')
+    say(f'Conflicts: {len(confl)} record(s) overridden by two or more mods')
+    for cat, n in sorted(by_cat.items(), key=lambda kv: (conflicts_mod.SEVERITY_RANK[
+            conflicts_mod.CATEGORY_INFO.get(kv[0], ('', 'low'))[1]], -kv[1])):
+        label, sev = conflicts_mod.CATEGORY_INFO.get(cat, conflicts_mod.CATEGORY_INFO['other'])
+        say(f'  {n:6}  {label} ({sev})')
+    if args.deep:
+        say(f'Deep comparison of {deep_done} record(s): ' +
+            ', '.join(f'{v} {k}' for k, v in sorted(statuses.items())) +
+            ('' if deep_done == len(confl) else f'  (limited by --max-deep {args.max_deep})'))
+        say('  identical = all versions equal; resolved = winner keeps everyone\'s changes; lists = list entries '
+            'lost; forwardable = fields silently reverted by the winner; clash = mods changed the same field '
+            'differently')
+    if dirty:
+        say('Dirty edits: ' + ', '.join(f'{k} ({v["udr"]} deleted refs, {v["deleted_navmesh"]} deleted navmeshes)'
+                                         for k, v in dirty.items()))
+    if args.details:
+        say('')
+        say('Conflicting records:')
+        for c in confl[:args.limit_records]:
+            st = f' [{c.deep["status"]}]' if c.deep else (' [patched]' if c.patched else '')
+            say(f'  {c.sig} {c.formkey}: {" > ".join(v.entry.name for v in c.overriders)}{st}')
+            if c.deep:
+                for l in c.deep.get('losers', []):
+                    for sig, kind, det in l['lost'][:6]:
+                        say(f'      {l["plugin"]} loses {sig} ({kind}): {det}')
+    say('')
+    say(f'Recommendations ({len(adv)}):')
+    for n, a in enumerate(adv[:args.limit], 1):
+        say(f'{n:3}. [{advice.PRIORITY_NAMES[a.priority]}] {a.title}')
+        if a.why:
+            say(f'       why: {a.why}')
+        for h in a.how[:6]:
+            say(f'       - {h}')
+        if a.tools:
+            say(f'       tools: {"; ".join(advice.TOOLS.get(t, t) for t in a.tools)}')
+    if len(adv) > args.limit:
+        say(f'... {len(adv) - args.limit} more (raise --limit or use --json)')
+    if not args.deep and confl:
+        say('Run with --deep to compare field by field and see exactly whose changes are lost.')
+    if model.mo2_profile and adv:
+        say('MO2: the suggested commands include --mo2 so they find plugins in your mod folders; create new '
+            'patches inside a new mod folder (e.g. --into "<mods>/My Patch/Patch.esp") and enable that mod.')
+
+
+def cmd_eslify(args):
+    model = load_model(args)
+    cands = eslify_mod.analyse(model, configs=args.configs, deep_configs=args.deep_configs)
+    order = model.effective_order()
+    n_light = sum(1 for e in order if model.is_light(e))
+    n_full = len(order) - n_light
+    max_full = model.max_full(order)
+    steps = eslify_mod.procedure(eslify_mod._game_supports_171(model))
+    if args.json:
+        say(dumps({'full_plugins': n_full, 'full_limit': max_full, 'light_plugins': n_light,
+                   'candidates': [c.as_dict() for c in cands], 'procedure': steps}))
+        return
+    groups = {}
+    for c in cands:
+        groups.setdefault(c.verdict, []).append(c)
+    say(f'{n_full} of {max_full} full plugin slots used; {n_light} light plugins')
+    titles = {
+        'flag': 'Can be ESL-flagged as they are (no FormIDs change): esp esl <plugin> --flag',
+        'flag-171': 'Can be ESL-flagged after setting header 1.71 (no FormIDs change; game 1.6.1130+ or BEES): '
+                    'esp esl <plugin> --header-171 --flag',
+        'compact': 'Can become light after compacting FormIDs (nothing found that uses them; new game needed)',
+        'compact-care': 'Compacting would break files that use their FormIDs: only with ESLifier, or leave as is',
+        'no': 'Should stay full plugins',
+        'already': 'Already light',
+    }
+    for v in ('flag', 'flag-171', 'compact', 'compact-care', 'no', 'already'):
+        lst = groups.get(v, [])
+        if not lst:
+            continue
+        say(f'\n{titles[v]}: {len(lst)}')
+        for c in lst[:args.limit]:
+            extra = f' ids {c.id_range}' if c.id_range else ' (only overrides)'
+            deps = f', master of {len(c.dependents)}' if c.dependents else ''
+            say(f'  {c.entry.name}: {c.n_new} new{extra}{deps}')
+            for r in c.risks:
+                say(f'      risk: {r}')
+            if v == 'no':
+                for r in c.reasons:
+                    say(f'      {r}')
+            for f in c.files[:5]:
+                say(f'      file: {f}')
+        if len(lst) > args.limit:
+            say(f'  ... {len(lst) - args.limit} more')
+    say('\nHow to do it safely:')
+    for i, st in enumerate(steps, 1):
+        say(f'  {i}. {st}')
+    if not args.configs:
+        say('Add --configs to also search SKSE/INI/JSON configs that reference each plugin\'s FormIDs.')
+
+
+# ---------------------------------------------------------------------------
 # argument parsing
 # ---------------------------------------------------------------------------
 
@@ -998,6 +1431,8 @@ def build_parser():
     common.add_argument('--data', help='game Data folder (to find masters, strings, BSAs)')
     common.add_argument('--encoding', help='text encoding of plugin strings (default cp1252)')
     common.add_argument('--lang', default='english', help='strings language (default english)')
+    common.add_argument('--mo2', help='Mod Organizer 2 profile folder: find plugins, masters, strings and BSAs '
+                        'in its enabled mods (by priority) as the game sees them')
     write = argparse.ArgumentParser(add_help=False)
     write.add_argument('-o', '--output', help='write to this file instead of in place')
     write.add_argument('--no-backup', action='store_true', help='do not keep a .bak when writing in place')
@@ -1129,6 +1564,8 @@ def build_parser():
     sp.add_argument('plugin')
     sp.add_argument('--flag', action='store_true')
     sp.add_argument('--unflag', action='store_true')
+    sp.add_argument('--header-171', action='store_true',
+                    help='set header version 1.71 first (allows object IDs 001-7FF; game 1.6.1130+ or BEES)')
     sp.add_argument('--json', action='store_true')
 
     sp = add('compact', cmd_compact, 'renumber new records into the ESL range (0x800-0xFFF)', parents=[write])
@@ -1170,6 +1607,60 @@ def build_parser():
     sp.add_argument('plugin')
     sp.add_argument('--search')
     sp.add_argument('--limit', type=int, default=50)
+
+    lo_src = argparse.ArgumentParser(add_help=False)
+    lo_src.add_argument('plugins', nargs='*', help='plugin files/names in load order (instead of a plugins.txt)')
+    lo_src.add_argument('--plugins-txt', help='plugins.txt (Steam: %%LOCALAPPDATA%%\\Skyrim Special Edition\\plugins.txt)')
+    lo_src.add_argument('--loadorder-txt', help='loadorder.txt with the full order (LOOT / MO2 / Wrye Bash)')
+    lo_src.add_argument('--mods', help='MO2 mods folder (default: from ModOrganizer.ini)')
+    lo_src.add_argument('--ccc', help='Skyrim.ccc (default: next to the Data folder)')
+    lo_src.add_argument('--no-cache', action='store_true', help='rescan every plugin (ignore the scan cache)')
+    lo_src.add_argument('--masterlist', help='LOOT masterlist (.yaml needs PyYAML, or a json(.gz) snapshot); '
+                        '"none" to skip LOOT data. Default: bundled snapshot or the one from esp loot-update')
+    lo_src.add_argument('--userlist', help='LOOT/Vortex userlist.yaml (default: found automatically)')
+    lo_src.add_argument('--no-loot', action='store_true', help='ignore LOOT masterlist/userlist metadata')
+
+    sp = add('loadorder', cmd_loadorder, 'check a load order (masters, flags, limits) and suggest a fixed order',
+             parents=[lo_src],
+             epilog='Examples:\n'
+                    '  esp loadorder --data "D:/Skyrim Special Edition/Data" --plugins-txt "%LOCALAPPDATA%/Skyrim Special Edition/plugins.txt"\n'
+                    '  esp loadorder --mo2 "D:/MO2/profiles/Default" --data "D:/Skyrim Special Edition/Data"\n'
+                    '  esp loadorder ... --write plugins_sorted.txt\n'
+                    'Rules file (--rules): {"Plugin.esp": {"after": ["Other.esp"], "before": ["X.esp"]}}')
+    sp.add_argument('--rules', help='JSON file with extra "load after/before" rules')
+    sp.add_argument('--write', help='write the suggested order as a plugins.txt to this path')
+    sp.add_argument('--write-loadorder', help='also write it as a loadorder.txt (MO2 profiles keep both in sync)')
+    sp.add_argument('--no-overlap', action='store_true', help='do not use LOOT\'s record-overlap rule when sorting')
+    sp.add_argument('--no-groups', action='store_true', help='do not use LOOT groups when sorting')
+    sp.add_argument('--groups', action='store_true', help='show each plugin\'s LOOT group')
+    sp.add_argument('--all', action='store_true', help='also print notes (info-level findings)')
+    sp.add_argument('--brief', action='store_true', help='do not print the whole order')
+    sp.add_argument('--full-order', action='store_true', help='print the whole suggested order')
+    sp.add_argument('--sources', action='store_true', help='show which MO2 mod / folder each plugin comes from')
+    sp.add_argument('--json', action='store_true')
+
+    sp = add('scan', cmd_scan, 'scan a whole load order for conflicts and get recommendations '
+             '(patches, Bashed Patch, Mator Smash, Synthesis, EasyNPC, ESL)', parents=[lo_src])
+    sp.add_argument('--deep', action='store_true', help='compare conflicting records field by field (slower)')
+    sp.add_argument('--max-deep', type=int, default=20000, help='cap on records compared with --deep')
+    sp.add_argument('--only', action='append', help='only conflicts involving this plugin (repeatable)')
+    sp.add_argument('-t', '--type', action='append', help='only these record types')
+    sp.add_argument('--details', action='store_true', help='list every conflicting record')
+    sp.add_argument('--limit', type=int, default=40, help='max recommendations printed')
+    sp.add_argument('--limit-records', type=int, default=500, help='max records listed with --details/--json')
+    sp.add_argument('--json', action='store_true')
+
+    sp = add('eslify', cmd_eslify, 'which plugins can become light (ESL) plugins, and what compacting would break',
+             parents=[lo_src])
+    sp.add_argument('--configs', action='store_true',
+                    help='also look for INI/JSON configs (SPID, KID, BOS...) that mention each plugin')
+    sp.add_argument('--deep-configs', action='store_true', help='with --configs: search whole mod folders, not just SKSE/')
+    sp.add_argument('--limit', type=int, default=60)
+    sp.add_argument('--json', action='store_true')
+
+    sp = add('loot-update', cmd_loot_update, 'refresh the LOOT masterlist used by loadorder/scan (needs PyYAML)')
+    sp.add_argument('source', nargs='?', help='masterlist.yaml file or URL (default: LOOT\'s Skyrim SE masterlist '
+                    'on GitHub, branch v0.29)')
 
     sp = add('bsa', cmd_bsa, 'list or extract files from a BSA archive')
     sp.add_argument('archive')

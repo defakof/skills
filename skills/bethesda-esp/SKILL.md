@@ -1,6 +1,6 @@
 ---
 name: bethesda-esp
-description: Read, inspect, edit and patch Bethesda plugin files (.esp, .esm, .esl) for Skyrim Special Edition / Anniversary Edition (Skyrim LE plugins also work). Use when the user wants to look inside a mod's plugin, list or search records (weapons, armor, NPCs, leveled lists, recipes, containers, cells, placed references, quests, dialogue), change fields (damage, value, weight, keywords, inventory, flags, names), delete or disable records, find conflicts between mods, build compatibility or merged patches, clean ITMs, add/clean masters, compact FormIDs and flag plugins as ESL, delocalize strings, or read BSA archives - xEdit/SSEEdit-style work from the command line. Bundled zero-dependency Python CLI keeps unmodified data byte-identical; optional Spriggit (Mutagen) path for full-schema YAML editing.
+description: Read, inspect, edit and patch Bethesda plugin files (.esp, .esm, .esl) for Skyrim Special Edition / Anniversary Edition (Skyrim LE plugins also work), and analyse whole load orders. Use when the user wants to look inside a mod's plugin, list or search records (weapons, armor, NPCs, leveled lists, recipes, containers, cells, placed references, quests, dialogue), change fields, delete or disable records, check or sort a plugin load order (plugins.txt, MO2 profile, LOOT rules, masters, ESL limits), scan a load order for conflicts and decide how to fix them (compatibility patch, merged patch, Bashed Patch, Synthesis, Mator Smash, EasyNPC), find ESL-flag candidates (ESLify), clean ITMs and deleted references, add/clean masters, compact FormIDs, delocalize strings, or read BSA archives - xEdit/SSEEdit and LOOT-style work from the command line. Bundled zero-dependency Python CLI keeps unmodified data byte-identical; optional Spriggit (Mutagen) path for full-schema YAML editing.
 license: MIT
 compatibility: Needs Python 3.8+ (no packages). Optional - .NET 10 SDK for the Spriggit full-schema workflow.
 ---
@@ -34,10 +34,13 @@ the plugin that defines it; master-order independent, preferred) or **file-local
    found. Masters next to the plugin are found automatically.
 4. Before editing a record, `esp show` it. After writing, re-`show` it (or `esp verify file`) to confirm.
 5. If the user's mod manager is MO2, plugins live in `mods/<ModName>/` and the load order in
-   `profiles/<Profile>/plugins.txt`; pass the files you need (or `--data` to the real Data folder).
+   `profiles/<Profile>/plugins.txt`: add `--mo2 "<MO2>/profiles/<Profile>"` to any command and plugin
+   names are found in the enabled mods by priority (as the game sees them). Put new patches in a new
+   mod folder (`--into "<MO2>/mods/My Patch/My Patch.esp"`) and tell the user to enable that mod.
 6. Placed references (REFR/ACHR) from masters must not be *deleted* (crash risk) - use
    `esp delete --disable` (undelete + initially disabled + moved below the world, as xEdit does).
-7. New records in an ESL-flagged plugin need object IDs 0x800-0xFFF (`esp esl`, `esp compact`).
+7. New records in an ESL-flagged plugin need object IDs 0x800-0xFFF (0x001-0xFFF with header 1.71,
+   game 1.6.1130+) (`esp esl`, `esp compact`).
 8. Plugins that use the edited plugin as a master break if you delete/renumber records they use.
 
 ## Inspect
@@ -100,6 +103,41 @@ esp merge ModA.esp ModB.esp --into MyPatch.esp                            # or: 
 - The patch must load **after** the mods it patches. Tell the user to enable it and sort it last.
 - `esp copy X REC --to Y --as-new --edid NewId` duplicates a record as a new one (new FormID).
 
+## Whole load order: sort, scan conflicts, plan patches
+
+Plugins only (not BSA/loose-file priority). Give the load order as an MO2 profile folder
+(`--mo2 "<MO2>/profiles/<Profile>"`, finds the game, mod folders and priorities) or as
+`--plugins-txt` + `--data "<Skyrim>/Data"` (Steam: `%LOCALAPPDATA%\Skyrim Special Edition\Plugins.txt`).
+
+```bash
+esp loadorder --mo2 "D:/MO2/profiles/Default" --groups     # errors, warnings, suggested moves (and why)
+esp loadorder ... --write plugins_sorted.txt               # suggested order as a plugins.txt (review first)
+esp scan ...                                               # every multi-mod conflict + prioritized fixes
+esp scan ... --deep [--details]                            # field-level: whose changes are lost, clashes
+esp eslify ... [--configs]                                 # which plugins can be ESL-flagged, what compaction breaks
+```
+
+- `loadorder` applies the game's rules (hardcoded + Creation Club first, masters before plugins,
+  hoisting, 254 full / 4096 light slots, header 1.71 vs game version/BEES) and LOOT's: a bundled
+  copy of the LOOT masterlist (groups, load-after/requirement/incompatibility rules, dirty CRCs,
+  warnings) plus the user's LOOT/Vortex `userlist.yaml`, then the LOOT overlap rule. Fix every
+  ERROR first. Moves keep the user's order wherever no rule demands a change.
+- Apply orders through the user's tool when possible: LOOT inside MO2, Vortex rules; otherwise
+  replace plugins.txt with the mod manager closed (MO2: the profile's plugins.txt **and**
+  loadorder.txt - `--write ... --write-loadorder ...` - because MO2 reads the order from loadorder.txt). Manual moves are
+  undone by the next LOOT sort - persist them as LOOT userlist rules (`--rules` uses the same idea).
+- `scan` recommendations name the tool per conflict type: leveled lists/inventories -> Bashed
+  Patch (Wrye Bash) or `esp merge`; keyword unions -> `esp merge`/Synthesis Fusion Patcher/KID;
+  NPC appearance -> NPC Plugin Chooser 2 / EasyNPC; quests/scripts/perks -> hand-made patch;
+  navmesh -> authors' patch or Creation Kit; broad merges -> Bashed Patch then Synthesis; Mator
+  Smash only as a legacy last resort. Generated patches load last (Bashed -> Synthesis ->
+  DynDOLOD) and must be rebuilt after changes.
+- Flag-only ESL (`esp esl X.esp --flag`) changes no FormIDs; compaction breaks saves, FaceGen,
+  voice, scripts and configs - use ESLifier for those.
+- `esp loot-update` refreshes the masterlist copy (needs `pip install pyyaml`).
+
+Full background, tool status and a decision table: `references/loadorder.md`.
+
 ## Create, delete, clean
 
 ```bash
@@ -109,10 +147,10 @@ esp add MyMod.esp GLOB --edid MyGlobal FNAM=f FLTV=2.5
 esp add MyMod.esp MISC --edid MyGem "FULL=Shiny Gem" 'DATA={"value":250,"weight":0.1}'
 esp delete MyMod.esp OldRecord            # refuses if other records in the file still use it (--force)
 esp delete MyPatch.esp 0x00012345 --mark  # keep an override but flag it Deleted
-esp delete MyMod.esp SomeRef --disable    # safe removal of placed references
+esp delete MyMod.esp SomeRef --disable    # safe removal of placed references (also fixes deleted refs/UDRs)
 esp itm MyMod.esp [--clean]               # identical-to-master records
 esp masters MyMod.esp [--add X.esm] [--clean]   # FormIDs are remapped, never broken
-esp esl MyMod.esp [--flag]  /  esp compact MyMod.esp
+esp esl MyMod.esp [--flag] [--header-171]  /  esp compact MyMod.esp
 esp delocalize Localized.esp -o Inline.esp      # needs its Strings/*.STRINGS (loose or in BSA)
 esp bsa "Skyrim - Interface.bsa" --filter strings   # list / --extract from BSAs (SE LZ4 + LE zlib)
 ```
@@ -150,6 +188,7 @@ Short version: `dotnet tool install -g Spriggit.CLI`, then
 
 - `references/commands.md` - every command and option with examples
 - `references/records.md` - common record types, fields, flags, condition functions, biped slots
+- `references/loadorder.md` - load order rules, LOOT, conflict types and which tool fixes them, ESLify
 - `references/format.md` - how plugins are built (FormIDs, masters, groups, ESL, localization)
 - `references/python-api.md` - scripting bulk edits with the `esplib` package
 - `references/spriggit.md` - optional full-schema YAML workflow

@@ -476,7 +476,9 @@ def new_record(plugin, sig, edid=None, fields=None, lo=None):
     for item in fields or []:
         items.append(item)
     parser = lo.parser_for(plugin) if lo else None
-    subs = encode_items(sig, items, plugin, formid_parser=parser)
+    ctx_rec = Record(sig, 0, 0, [Subrecord('EDID', edid.encode(plugin.encoding) + b'\0')] if edid else [], 44)
+    ctx_rec.plugin = plugin          # GMST values are typed by their EditorID
+    subs = encode_items(sig, items, plugin, record=ctx_rec, formid_parser=parser)
     rec = Record(sig, allocate_formid(plugin), 0, subs, 44)
     rec._raw = None
     place_record(plugin, rec, {})
@@ -518,6 +520,31 @@ def mark_deleted(plugin, rec):
     keep = [s for s in rec.subrecords if s.sig == 'EDID']
     rec._subs = keep
     rec.touched()
+
+
+def restore_from_masters(lo, plugin, rec):
+    """Give a stripped deleted override (only a header, as the Creation Kit
+    writes deleted references) the fields of the latest version in the
+    plugin's masters, so it can be undeleted."""
+    idx = rec.formid >> 24
+    if idx >= len(plugin.masters):
+        raise EspError(f'{rec.label()} is not an override; nothing to restore it from')
+    owner = plugin.masters[idx]
+    objid = rec.formid & 0xFFFFFF
+    for m in reversed(plugin.masters):
+        mp = lo.get(m, required=False) if lo is not None else None
+        if mp is None:
+            continue
+        lf = lo.local_fid(mp, objid, owner)
+        src = mp.find(lf) if lf is not None else None
+        if src is None or src.flags & FLAG_DELETED:
+            continue
+        subs, _changed, _w = remap_record_fields(src, mp, mapper(mp, plugin), None, None, dst_plugin=plugin)
+        rec._subs = [x.copy() for x in subs]
+        rec.touched()
+        return m
+    raise EspError(f'cannot find an undeleted version of {rec.label()} in the masters of {plugin.name} '
+                   '(pass --data so they are found)')
 
 
 def undelete_and_disable(plugin, rec):
@@ -648,12 +675,14 @@ def esl_report(plugin):
     worlds = [r for r in new if r.sig == 'WRLD']
     warn = []
     if cells:
-        warn.append(f'{len(cells)} new CELL record(s): new cells in light plugins can lose their '
-                    f'changes on reload in older runtimes; prefer keeping them in a full plugin')
+        warn.append(f'{len(cells)} new CELL record(s): in a light plugin, new cells overridden by other plugins '
+                    'lose temporary references and interior cells reload wrongly unless SSE Engine Fixes 7.0.14+ '
+                    '(bESLCELLLoadBug) is installed')
     if worlds:
-        warn.append(f'{len(worlds)} new WRLD record(s)')
+        warn.append(f'{len(worlds)} new WRLD record(s): light plugins can lose the landscape of new worldspaces '
+                    '(no fix exists); keep it a full plugin')
     if v171:
-        warn.append('header version 1.71: object IDs below 0x800 need Skyrim SE 1.6.1130+ (or BEES)')
+        warn.append('header version 1.71: needs Skyrim SE 1.6.1130+ (or BEES on older games)')
     return {
         'new_records': len(new), 'min_id': ids[0] if ids else None, 'max_id': ids[-1] if ids else None,
         'eligible_as_is': not problems, 'problems': problems, 'warnings': warn,
